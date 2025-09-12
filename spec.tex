@@ -1,0 +1,682 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tocloft}
+\usepackage{microtype}
+\usepackage{parskip}
+
+% Page geometry
+\geometry{
+    left=2.5cm,
+    right=2.5cm,
+    top=3cm,
+    bottom=3cm
+}
+
+% Code listing settings
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{codestyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=5pt,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=2,
+    frame=single,
+    framerule=0.5pt,
+    rulecolor=\color{gray!30}
+}
+
+\lstdefinelanguage{yaml}{
+    keywords={true,false,null,version,name,steps,provider,agent,command,output_capture,
+              for_each,items_from,items,as,wait_for,glob,timeout_sec,poll_ms,min_count,
+              on,success,failure,goto,when,equals,left,right,env,secrets,context,
+              provider_params,model,input_file,output_file,command_override,
+              allow_parse_error,strict_flow,providers,defaults,inbox_dir,processed_dir,
+              failed_dir,task_extension},
+    keywordstyle=\color{blue}\bfseries,
+    sensitive=false,
+    comment=[l]{\#},
+    morecomment=[s]{/*}{*/},
+    commentstyle=\color{codegreen},
+    stringstyle=\color{red},
+    morestring=[b]',
+    morestring=[b]"
+}
+
+\lstset{style=codestyle}
+
+% Header and footer
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Agent Orchestration Framework v1.1}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% Title formatting
+\titleformat{\section}{\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{1em}{}
+
+% Hyperref settings
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,
+    urlcolor=cyan,
+    pdftitle={Agent Orchestration Framework v1.1},
+    pdfauthor={},
+    bookmarks=true,
+    bookmarksopen=true,
+    bookmarksnumbered=true
+}
+
+% Document metadata
+\title{\Huge\textbf{Agent Orchestration Framework v1.1}\\[0.5cm]
+       \Large Technical Documentation}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+
+\newpage
+\tableofcontents
+\newpage
+
+\section{Executive Summary}
+
+This specification defines a workflow orchestration system that executes sequences of commands, including AI language model invocations, in a deterministic order. The system uses YAML files to define workflows with branching logic, conditionals, and loops based on step outputs. Filesystem directories serve as task queues for inter-process communication, and JSON files provide status reporting. Each workflow step can invoke shell commands or language model CLIs (like Claude or Gemini), capture their output in structured formats (text, lines array, or JSON), and use that output to control subsequent steps through conditional branching or dynamic iteration.
+
+\section{Architecture Overview}
+
+\subsection{Directory Layout}
+
+\begin{lstlisting}[language=bash, caption={Workspace Directory Structure}]
+workspace/
+|-- src/                    # User source code
+|-- prompts/               # Reusable prompt templates
+|-- artifacts/             # Agent-generated outputs
+|   |-- architect/
+|   |-- engineer/
+|   \-- qa/
+|-- inbox/                 # Agent work queues
+|   |-- architect/
+|   |-- engineer/
+|   \-- qa/
+|-- processed/             # Completed work items
+|   \-- {timestamp}/
+\-- failed/               # Failed work items (quarantine)
+    \-- {timestamp}/
+\end{lstlisting}
+
+\textbf{Path Resolution Rule:} All user-declared paths remain explicit and resolve against WORKSPACE. No auto-prefixing based on agent.
+
+\subsection{Task Queue System}
+
+The framework uses filesystem directories as task queues for coordinating work between workflow steps and agents. The \texttt{inbox/} directory contains pending tasks, \texttt{processed/} contains successfully completed tasks, and \texttt{failed/} contains tasks that could not be processed.
+
+\subsubsection{Task Lifecycle}
+\begin{enumerate}
+    \item \textbf{Task Creation:} Write content to \texttt{*.tmp} file in target inbox
+    \item \textbf{Task Activation:} Atomically rename \texttt{*.tmp} to \texttt{*.task}
+    \item \textbf{Task Processing:} Agent or step reads \texttt{*.task} file
+    \item \textbf{Task Completion:}
+    \begin{itemize}
+        \item Success: Move to \texttt{processed/\{timestamp\}/}
+        \item Failure: Move to \texttt{failed/\{timestamp\}/}
+    \end{itemize}
+\end{enumerate}
+
+The atomic rename operation ensures that partially-written files are never visible as tasks. Task files contain freeform text, with JSON recommended for structured data exchange.
+
+\subsubsection{Configuration}
+
+\begin{lstlisting}[language=yaml, caption={Inbox Configuration}]
+# Top-level workflow config (with defaults)
+inbox_dir: "inbox"
+processed_dir: "processed"
+failed_dir: "failed"
+task_extension: ".task"
+\end{lstlisting}
+
+\section{CLI Contract}
+
+\begin{lstlisting}[language=bash, caption={CLI Commands}]
+# Run workflow from beginning
+orchestrate run workflows/demo.yaml \
+  --context key=value \
+  --context-file context.json \
+  --clean-processed \           # Empty processed/ before run
+  --archive-processed output.zip # Archive processed/ on success
+
+# Resume failed/interrupted run
+orchestrate resume <run_id>
+
+# Execute single step
+orchestrate run-step <step_name> --workflow workflows/demo.yaml
+
+# Watch for changes and re-run
+orchestrate watch workflows/demo.yaml
+\end{lstlisting}
+
+\textbf{Safety:} The \texttt{--clean-processed} flag will only operate on the \texttt{WORKSPACE/processed/} directory and will refuse to run on any other path. The \texttt{--archive-processed} destination path must be outside of the \texttt{processed/} directory. If a destination is not provided, the archive defaults to \texttt{RUN\_ROOT/processed.zip}.
+
+\section{Variable Model}
+
+\subsection{Namespaces (precedence order)}
+
+\begin{enumerate}
+    \item \textbf{Run Scope}
+    \begin{itemize}
+        \item \texttt{\$\{run.timestamp\_utc\}} - The start time of the run, formatted as YYYYMMDDTHHMMSSZ
+    \end{itemize}
+    
+    \item \textbf{Loop Scope}
+    \begin{itemize}
+        \item \texttt{\$\{item\}} - Current iteration value
+        \item \texttt{\$\{loop.index\}} - Current iteration (0-based)
+        \item \texttt{\$\{loop.total\}} - Total iterations
+    \end{itemize}
+    
+    \item \textbf{Step Results}
+    \begin{itemize}
+        \item \texttt{\$\{steps.<name>.exit\_code\}} - Step completion code
+        \item \texttt{\$\{steps.<name>.output\}} - Step stdout (text mode)
+        \item \texttt{\$\{steps.<name>.lines\}} - Array when \texttt{output\_capture: lines}
+        \item \texttt{\$\{steps.<name>.json\}} - Object when \texttt{output\_capture: json}
+        \item \texttt{\$\{steps.<name>.duration\}} - Execution time
+    \end{itemize}
+    
+    \item \textbf{Context Variables}
+    \begin{itemize}
+        \item \texttt{\$\{context.<key>\}} - Variables provided via \texttt{--context key=value} CLI arguments or \texttt{--context-file} JSON files
+    \end{itemize}
+\end{enumerate}
+
+\subsection{Variable Substitution Scope}
+
+\subsubsection{Where Variables Are Substituted}
+\begin{itemize}
+    \item Command arrays: \texttt{["echo", "\$\{context.message\}"]}
+    \item File paths: \texttt{"artifacts/\$\{loop.index\}/result.md"}
+    \item Provider parameters: \texttt{model: "\$\{context.model\_name\}"}
+    \item Conditional values: \texttt{left: "\$\{steps.Previous.output\}"}
+\end{itemize}
+
+\subsubsection{Where Variables Are NOT Substituted}
+\begin{itemize}
+    \item File contents: The contents of files referenced by \texttt{input\_file}, \texttt{output\_file}, or any other file parameters are passed as-is without variable substitution
+\end{itemize}
+
+\subsubsection{Dynamic Content Pattern}
+
+To include dynamic content in files, use a pre-processing step:
+
+\begin{lstlisting}[language=yaml, caption={Dynamic Content Pattern}]
+# Assumes: orchestrate run workflow.yaml --context project_name="MyApp"
+steps:
+  # Step 1: Create dynamic prompt with substituted variables
+  - name: PreparePrompt
+    command: ["bash", "-c", "echo 'Analyze ${context.project_name}' > temp/prompt.md"]
+    
+  # Step 2: Use the prepared prompt
+  - name: Analyze
+    provider: "claude"
+    input_file: "temp/prompt.md"  # Contains substituted content
+\end{lstlisting}
+
+\textbf{Note:} Template processing for file contents is not currently supported. Files are passed literally without variable substitution.
+
+\subsection{Edge Case Behavior}
+
+The following behaviors are \textbf{implementation-defined}:
+
+\paragraph{Undefined Variables}
+\begin{itemize}
+    \item Implementations may substitute with empty string
+    \item Or leave literal \texttt{"\$\{undefined.var\}"} in place
+    \item Or raise an error and halt execution
+\end{itemize}
+
+\paragraph{Type Coercion in Conditions}
+\begin{itemize}
+    \item String comparison semantics are implementation-defined
+    \item Behavior when comparing JSON numbers to string literals is implementation-defined
+\end{itemize}
+
+\paragraph{Escape Syntax}
+\begin{itemize}
+    \item The method to output literal \texttt{"\$\{"} in strings is implementation-defined
+\end{itemize}
+
+\paragraph{Recommendations for Portability}
+
+To ensure workflows run consistently across implementations:
+\begin{itemize}
+    \item Always initialize variables before use via \texttt{context} or prior steps
+    \item Use explicit string values in conditions: \texttt{"true"} rather than boolean \texttt{true}
+    \item Avoid literal \texttt{"\$\{"} in strings
+    \item Document implementation requirements if using edge cases
+\end{itemize}
+
+
+\section{Step Schema}
+
+\subsection{Fields}
+
+\begin{lstlisting}[language=yaml, caption={Step Schema Fields}]
+# Agent label (optional)
+agent: "engineer"  # Informational label only; doesn't affect path resolution
+
+# Output capture mode
+output_capture: "text"  # Default: text | lines | json
+
+# Dynamic for-each from prior step
+for_each:
+  items_from: "steps.CheckInbox.lines"  # Reference array from prior step
+  # OR literal array:
+  items: ["a", "b", "c"]
+  as: item
+  steps: [...]
+
+# Optional, only applies when output_capture: json
+allow_parse_error: false
+
+# Provider specification
+provider: "claude"
+provider_params:
+  model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+
+# Command override
+command_override: ["claude", "-p", "Custom prompt"]
+
+# Wait for files (blocking primitive for inter-agent communication)
+wait_for:
+  glob: "inbox/engineer/replies/*.task"  # File pattern to watch
+  timeout_sec: 1800                      # Max wait time (default: 300)
+  poll_ms: 500                          # Poll interval (default: 500)
+  min_count: 1                          # Min files required (default: 1)
+\end{lstlisting}
+
+\textbf{Pointer Syntax:} The value must be a string in the format \texttt{steps.<StepName>.lines} or \texttt{steps.<StepName>.json[.<dot.path>]}. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions.
+
+\subsection{Output Capture Modes}
+
+\subsubsection{\texttt{text} (default): Traditional string capture}
+
+\begin{lstlisting}[caption={Text Output Capture}]
+{
+  "output": "First line\nSecond line\n",
+  "truncated": false
+}
+\end{lstlisting}
+
+\subsubsection{\texttt{lines}: Split into array of lines}
+
+\begin{lstlisting}[caption={Lines Output Capture}]
+{
+  "output_capture": "lines",
+  "lines": ["inbox/engineer/task1.task", "inbox/engineer/task2.task"],
+  "truncated": false
+}
+\end{lstlisting}
+
+\subsubsection{\texttt{json}: Parse as JSON object}
+
+\begin{lstlisting}[caption={JSON Output Capture}]
+{
+  "output_capture": "json",
+  "json": {"success": true, "files": ["a.py", "b.py"]},
+  "truncated": false
+}
+\end{lstlisting}
+
+Parse failure → exit code 2 unless \texttt{allow\_parse\_error: true}
+
+\paragraph{Limits}
+\begin{itemize}
+    \item \textbf{text:} The first 8 KB of stdout is stored in the state file. If the stream exceeds 1 MB, it is spilled to a log file and the \texttt{output} field is marked as truncated.
+    \item \textbf{lines:} A maximum of 10,000 lines are stored. If exceeded, the \texttt{lines} array will contain the first 10,000 entries and a \texttt{truncated: true} flag will be set.
+    \item \textbf{json:} The orchestrator will buffer up to 1 MB of stdout for parsing. If stdout exceeds this limit, parsing fails with exit code 2 (unless \texttt{allow\_parse\_error: true}). Invalid JSON also results in exit code 2.
+\end{itemize}
+
+\textbf{State Fields:} When \texttt{output\_capture} is set to \texttt{lines} or \texttt{json}, the raw \texttt{output} field is omitted from the step's result in \texttt{state.json} to avoid data duplication.
+
+\section{Provider Execution Model}
+
+\subsection{Input/Output Contract}
+
+When a step specifies both \texttt{provider} and \texttt{input\_file}:
+
+\begin{enumerate}
+    \item \textbf{Input Handling:} The orchestrator reads \texttt{input\_file} contents and passes them as a command-line argument to the provider
+    \item \textbf{Output Handling:} If \texttt{output\_file} is specified, STDOUT is redirected to that file
+    \item \textbf{File contents passed literally:} The prompt text is passed as a CLI argument, not piped via STDIN
+\end{enumerate}
+
+\subsubsection{Example Execution}
+
+\begin{lstlisting}[language=yaml, caption={Provider Execution Example}]
+steps:
+  - name: Analyze
+    provider: "claude"
+    input_file: "prompts/analyze.md"
+    output_file: "artifacts/analysis.md"
+
+# Orchestrator reads the file:
+PROMPT_CONTENT=$(cat prompts/analyze.md)
+
+# Then executes:
+claude -p "$PROMPT_CONTENT" --model claude-3-5-sonnet > artifacts/analysis.md
+#      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#      Prompt text as CLI arg + model selection
+\end{lstlisting}
+
+\subsubsection{Prompt Contents}
+
+\begin{lstlisting}[caption={Example Prompt Content}]
+# prompts/analyze.md
+Analyze the system requirements and create a detailed architecture.
+Consider scalability, security, and maintainability.
+Read any files in artifacts/requirements/ for context.
+\end{lstlisting}
+
+\paragraph{Key Benefits}
+\begin{itemize}
+    \item \textbf{No duplication:} Prompt doesn't need to reference itself
+    \item \textbf{Natural prompts:} Write prompts as you normally would
+    \item \textbf{Provider flexibility:} Provider can still read other files mentioned IN the prompt
+    \item \textbf{Clean separation:} \texttt{input\_file} = the prompt, other files = data the prompt references
+\end{itemize}
+
+\subsection{Provider File Operations}
+
+\subsubsection{Concurrent File and Stream Output}
+
+Providers can read and write files directly from/to the filesystem while also outputting to STDOUT. These capabilities coexist:
+
+\begin{enumerate}
+    \item \textbf{Direct File Operations:} Providers may create, read, or modify files anywhere in the workspace based on prompt instructions
+    \item \textbf{STDOUT Capture:} The \texttt{output\_file} parameter captures STDOUT (typically logs, status messages, or reasoning process)
+    \item \textbf{Simultaneous Operation:} A provider invocation may write multiple files AND produce STDOUT output
+\end{enumerate}
+
+\begin{lstlisting}[language=yaml, caption={Provider File Operations Example}]
+steps:
+  - name: GenerateSystem
+    agent: "architect"
+    provider: "claude"
+    input_file: "prompts/design.md"
+    output_file: "artifacts/architect/execution_log.md"  # Captures STDOUT
+    # Provider may also create files directly:
+    # - artifacts/architect/system_design.md
+    # - artifacts/architect/api_spec.md
+    # - artifacts/architect/data_model.md
+\end{lstlisting}
+
+
+\subsection{Best Practices}
+
+\begin{itemize}
+    \item Use \texttt{output\_file} to capture execution logs and agent reasoning for debugging
+    \item Design prompts to write primary outputs as files to appropriate directories
+    \item Use subsequent steps to discover and validate created files
+    \item Document expected file outputs in step comments for clarity
+\end{itemize}
+
+\section{Provider Configuration}
+
+\subsection{Direct CLI Integration}
+
+\textbf{Important:} The providers are Claude Code (\texttt{claude}), Gemini CLI (\texttt{gemini}), and similar tools - NOT raw API calls.
+
+\subsubsection{Workflow-level templates}
+
+\begin{lstlisting}[language=yaml, caption={Provider Configuration}]
+providers:
+  claude:
+    command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
+    defaults:
+      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+  
+  gemini:
+    command: ["gemini", "-p", "${PROMPT}"]
+    # Gemini CLI doesn't support model selection via CLI
+\end{lstlisting}
+
+\subsubsection{Step-level usage}
+
+\begin{lstlisting}[language=yaml, caption={Step-level Provider Usage}]
+steps:
+  - name: Analyze
+    provider: "claude"
+    provider_params:
+      model: "claude-3-5-sonnet"  # or claude-3-5-haiku for faster/cheaper
+    input_file: "prompts/analyze.md"
+    output_file: "artifacts/architect/analysis.md"
+
+  - name: CustomProvider
+    command_override: ["claude", "-p", "Special prompt", "--model", "claude-3-5-haiku"]
+\end{lstlisting}
+
+\textbf{Note:} Claude Code is invoked with \texttt{claude -p "prompt" --model <model>}. Available models:
+\begin{itemize}
+    \item \texttt{claude-3-5-sonnet} (or \texttt{claude-3-5-sonnet-20241022})
+    \item \texttt{claude-3-5-haiku} (or \texttt{claude-3-5-haiku-20241022}) - faster/cheaper
+    \item \texttt{claude-3-opus-latest} - most capable
+\end{itemize}
+
+Model can also be set via \texttt{ANTHROPIC\_MODEL} environment variable or \texttt{claude config set model}.
+
+\paragraph{Exit code mapping}
+\begin{itemize}
+    \item 0 = Success
+    \item 1 = Retryable API error
+    \item 2 = Invalid input (non-retryable)
+    \item 124 = Timeout (retryable)
+\end{itemize}
+
+\section{Status Communication}
+
+\subsection{Status JSON Schema}
+
+\begin{lstlisting}[caption={Status JSON Schema}]
+{
+  "schema": "status/v1",
+  "correlation_id": "uuid-or-opaque",
+  "agent": "engineer",
+  "run_id": "uuid",
+  "step": "ImplementFeature",
+  "timestamp": "2025-01-15T10:30:00Z",
+  "success": true,
+  "exit_code": 0,
+  "outputs": ["artifacts/engineer/implementation.py"],
+  "metrics": {
+    "files_modified": 3,
+    "lines_added": 150
+  },
+  "next_actions": [
+    {
+      "agent": "qa",
+      "file": "inbox/qa/review_implementation.task"
+    }
+  ],
+  "message": "Feature implemented successfully"
+}
+\end{lstlisting}
+
+\textbf{Default path:} \texttt{artifacts/<agent>/status.json} or \texttt{status\_<step>.json}
+
+\textbf{Path Convention:} All file paths included within a status JSON file (e.g., in the \texttt{outputs} array) must be relative to the WORKSPACE directory.
+
+\section{Example: Multi-Agent Inbox Processing}
+
+\begin{lstlisting}[language=yaml, caption={Multi-Agent Feature Development Workflow}]
+version: "1.1"
+name: "multi_agent_feature_dev"
+strict_flow: true
+
+providers:
+  claude:
+    command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
+    defaults:
+      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+
+steps:
+  # Check for pending engineer tasks
+  - name: CheckEngineerInbox
+    command: ["find", "inbox/engineer", "-name", "*.task", "-type", "f"]
+    output_capture: "lines"
+    on:
+      success:
+        goto: ProcessEngineerTasks
+      failure:
+        goto: NoTasks
+
+  # Process each task
+  - name: ProcessEngineerTasks
+    for_each:
+      items_from: "steps.CheckEngineerInbox.lines"
+      as: task_file
+      steps:
+        - name: ImplementWithClaude
+          agent: "engineer"
+          provider: "claude"
+          provider_params:
+            model: "claude-3-5-sonnet"
+          input_file: "${task_file}"  # task_file is already a full path from find
+          output_file: "artifacts/engineer/execution_log_${loop.index}.md"
+          # Note: Claude will create implementation files directly
+          
+        - name: WriteStatus
+          command: ["echo", '{"success": true, "task": "${task_file}"}']
+          output_file: "artifacts/engineer/status_${loop.index}.json"
+          output_capture: "json"
+          
+        - name: MoveToProcessed
+          command: ["mv", "${task_file}", "processed/${run.timestamp_utc}_${loop.index}/"]
+          
+        - name: CreateQATask
+          when:
+            equals:
+              left: "${steps.WriteStatus.json.success}"
+              right: "true"
+          command: ["bash", "-c", "
+            echo 'Review impl_${loop.index}.py' > inbox/qa/review_${loop.index}.tmp &&
+            mv inbox/qa/review_${loop.index}.tmp inbox/qa/review_${loop.index}.task
+          "]
+
+  - name: NoTasks
+    command: ["echo", "No pending tasks"]
+    on:
+      success:
+        goto: _end
+\end{lstlisting}
+
+\section{Prompt Management Patterns}
+
+\subsection{Directory Purpose Clarification}
+
+\begin{itemize}
+    \item \textbf{\texttt{prompts/}}: Static, reusable prompt templates created by workflow authors before execution
+    \item \textbf{\texttt{inbox/}}: Dynamic task files for agent coordination, created during workflow execution
+    \item \textbf{\texttt{temp/}}: Temporary files for dynamic prompt composition and intermediate processing
+\end{itemize}
+
+\subsection{Multi-Agent Coordination Pattern}
+
+When agent B needs to process outputs from agent A:
+
+\begin{lstlisting}[language=yaml, caption={Multi-Agent Coordination Pattern}]
+steps:
+  # Step 1: Agent A creates artifacts
+  - name: ArchitectDesign
+    agent: "architect"
+    provider: "claude"
+    input_file: "prompts/architect/design.md"  # Contains prompt text
+    output_file: "artifacts/architect/log.md"   # Captures STDOUT
+    
+    # prompts/architect/design.md contains:
+    # "Create a system architecture. Read requirements from artifacts/requirements/*.md
+    #  Write your design to artifacts/architect/system_design.md and api_spec.md"
+    
+    # Executes as:
+    # claude -p "Create a system architecture..." --model claude-3-5-sonnet > artifacts/architect/log.md
+    
+  # Step 2: Compose dynamic task for Agent B (atomic write)
+  - name: PrepareEngineerTask
+    command: ["bash", "-c", "
+      echo 'Implement the following designs:' > inbox/engineer/task_${run.timestamp_utc}.tmp &&
+      echo '' >> inbox/engineer/task_${run.timestamp_utc}.tmp &&
+      cat artifacts/architect/*.md >> inbox/engineer/task_${run.timestamp_utc}.tmp &&
+      mv inbox/engineer/task_${run.timestamp_utc}.tmp inbox/engineer/task_${run.timestamp_utc}.task
+    "]
+    
+  # Step 3: Agent B processes dynamic task
+  - name: EngineerImplement
+    agent: "engineer"
+    provider: "claude"
+    input_file: "inbox/engineer/task_${run.timestamp_utc}.task"  # Dynamically composed
+\end{lstlisting}
+
+\subsection{Best Practices}
+
+\begin{itemize}
+    \item Keep static templates generic (reference concepts, not specific files)
+    \item Build dynamic prompts at runtime to reference actual artifacts
+    \item Use \texttt{inbox/} for agent work queues to maintain clear task boundaries
+    \item Document the expected flow between agents in workflow comments
+\end{itemize}
+
+\section{Acceptance Tests}
+
+\begin{enumerate}
+    \item \textbf{Lines capture:} \texttt{output\_capture: lines} → \texttt{steps.X.lines[]} populated
+    \item \textbf{JSON capture:} \texttt{output\_capture: json} → \texttt{steps.X.json} object available
+    \item \textbf{Dynamic for-each:} \texttt{items\_from: "steps.List.lines"} iterates correctly
+    \item \textbf{Status schema:} Write/read status.json with v1 schema
+    \item \textbf{Inbox atomicity:} \texttt{*.tmp} → \texttt{rename()} → visible as \texttt{*.task}
+    \item \textbf{Processed/failed:} Success → \texttt{processed/\{ts\}/}, failure → \texttt{failed/\{ts\}/}
+    \item \textbf{No env namespace:} \texttt{\$\{env.*\}} rejected by schema validator
+    \item \textbf{Provider templates:} Template + defaults + params compose argv correctly
+    \item \textbf{Command override:} Replaces template entirely
+    \item \textbf{Clean processed:} \texttt{--clean-processed} empties directory
+    \item \textbf{Archive processed:} \texttt{--archive-processed} creates zip on success
+    \item \textbf{Pointer Grammar:} A workflow with \texttt{items\_from: "steps.X.json.files"} correctly iterates over the nested \texttt{files} array
+    \item \textbf{JSON Oversize:} A step producing >1 MB of JSON correctly fails with exit code 2
+    \item \textbf{JSON Parse Error Flag:} The same step from above succeeds if \texttt{allow\_parse\_error: true} is set
+    \item \textbf{CLI Safety:} \texttt{orchestrate run --clean-processed} fails if the processed directory is configured outside WORKSPACE
+    \item \textbf{Wait for files:} \texttt{wait\_for} step blocks until matching files appear or timeout
+    \item \textbf{Wait timeout:} \texttt{wait\_for} with no matching files exits with code 124 after timeout
+    \item \textbf{Wait state tracking:} \texttt{wait\_for} records \texttt{files}, \texttt{wait\_duration}, \texttt{poll\_count} in state.json
+\end{enumerate}
+
+\end{document}
