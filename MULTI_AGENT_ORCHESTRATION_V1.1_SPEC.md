@@ -1,12 +1,8 @@
-# Multi-Agent Workflow Orchestration Framework v1.1
-
-Version: 1.1  
-Status: APPROVED FOR IMPLEMENTATION  
-Date: January 2025
+# Agent orchestration framework 
 
 ## Executive Summary
 
-A developer-centric orchestrator for rapidly building, testing, and iterating on AI agent and CLI tool workflows. Version 1.1 enhances multi-agent coordination through filesystem-backed patterns while maintaining deterministic, sequential execution.
+A developer-centric orchestrator for rapidly building, testing, and iterating on AI agent and CLI tool workflows. 
 
 Core Principles:
 - Simplicity & Predictability: Sequential execution with explicit paths
@@ -64,20 +60,20 @@ task_extension: ".task"
 ## CLI Contract
 
 ```bash
-# Run workflow from beginning (v1.0 behavior preserved)
+# Run workflow from beginning
 orchestrate run workflows/demo.yaml \
   --context key=value \
   --context-file context.json \
   --clean-processed \           # Empty processed/ before run
   --archive-processed output.zip # Archive processed/ on success
 
-# Resume failed/interrupted run (v1.0 behavior preserved)
+# Resume failed/interrupted run
 orchestrate resume <run_id>
 
-# Execute single step (v1.0 behavior preserved)
+# Execute single step
 orchestrate run-step <step_name> --workflow workflows/demo.yaml
 
-# Watch for changes and re-run (v1.0 behavior preserved)
+# Watch for changes and re-run
 orchestrate watch workflows/demo.yaml
 ```
 
@@ -132,11 +128,11 @@ steps:
     input_file: "temp/prompt.md"  # Contains substituted content
 ```
 
-Future Enhancement: Version 1.2 may introduce opt-in template processing via a `process_template: true` flag.
+Note: Template processing for file contents is not currently supported. Files are passed literally without variable substitution.
 
 ### Edge Case Behavior
 
-The following behaviors are **implementation-defined** in v1.1 (standardization deferred to v2.0):
+The following behaviors are **implementation-defined**:
 
 Undefined Variables:
 - Implementations may substitute with empty string
@@ -173,9 +169,9 @@ steps:
 
 ---
 
-## Enhanced Step Schema
+## Step Schema
 
-### New Fields
+### Fields
 
 ```yaml
 # Agent label (optional)
@@ -200,7 +196,7 @@ provider: "claude"
 provider_params:
   model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
 
-# Command override (NEW)
+# Command override
 command_override: ["claude", "-p", "Custom prompt"]
 
 # Wait for files (blocking primitive for inter-agent communication)
@@ -211,7 +207,7 @@ wait_for:
   min_count: 1                          # Min files required (default: 1)
 ```
 
-Pointer Syntax: The value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions in v1.1.
+Pointer Syntax: The value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions.
 
 ### Output Capture Modes
 
@@ -370,7 +366,7 @@ Note: Claude Code is invoked with `claude -p "prompt" --model <model>`. Availabl
 
 Model can also be set via `ANTHROPIC_MODEL` environment variable or `claude config set model`.
 
-Exit code mapping (unchanged from v1.0):
+Exit code mapping:
 - 0 = Success
 - 1 = Retryable API error
 - 2 = Invalid input (non-retryable)
@@ -400,9 +396,7 @@ Exit code mapping (unchanged from v1.0):
   "next_actions": [
     {
       "agent": "qa",
-      "action": "review",
-      "file": "inbox/qa/review_implementation.task",
-      "priority": "high"
+      "file": "inbox/qa/review_implementation.task"
     }
   ],
   "message": "Feature implemented successfully"
@@ -416,7 +410,6 @@ Path Convention: All file paths included within a status JSON file (e.g., in the
 ## Example: Multi-Agent Inbox Processing
 
 ```yaml
-version: "1.1"
 name: "multi_agent_feature_dev"
 strict_flow: true
 
@@ -532,27 +525,7 @@ steps:
 
 ---
 
-## Migration from v1.0
-
-### Breaking Changes
-- `${env.*}` namespace removed → Use `${context.*}` or per-step `env:`
-
-### New Features (backward compatible)
-- `output_capture: lines|json` for structured data
-- `items_from:` for dynamic iteration
-- Direct CLI providers (Claude Code, Gemini) and `command_override`
-- Status JSON files
-- Inbox/processed/failed directories
-- `wait_for:` blocking file wait primitive
-
-### Migration Steps
-1. Replace `${env.VAR}` with `${context.VAR}` or add to step `env:`
-2. Optionally reorganize artifacts under agent subdirectories
-3. Incrementally adopt inbox pattern and status files
-
----
-
-## v1.1 Acceptance Tests
+## Acceptance Tests
 
 1. Lines capture: `output_capture: lines` → `steps.X.lines[]` populated
 2. JSON capture: `output_capture: json` → `steps.X.json` object available
@@ -575,62 +548,11 @@ steps:
 
 ---
 
-## Deferred to v2
+## Out of Scope
 
-### Concurrency
-- Sequential execution only in v1.1
-- v2 design note: Atomic `mv` as distributed lock for concurrent inbox processing
-
-### Advanced Features
+- Concurrency (sequential only)
 - While loops
 - Parallel execution blocks
 - Complex expression evaluation
 - Event-driven triggers
 
----
-
-## Implementation Order
-
-1. Schema Updates (Day 1)
-   - Remove env namespace validation
-   - Add output_capture, items_from, agent fields
-   - Add provider configuration schema
-
-2. Core Engine (Day 2-3)
-   - Output capture modes implementation
-   - Dynamic for-each from arrays
-   - Status file writing/reading
-
-3. Provider Integration (Day 4)
-   - Template system
-   - Direct CLI execution
-   - Command override support
-
-4. Inbox Pattern (Day 5)
-   - Atomic write helpers
-   - Move to processed/failed
-   - Directory initialization
-
-5. CLI Operations (Day 6)
-   - --clean-processed flag
-   - --archive-processed flag
-   - Directory structure validation
-
-6. Testing & Documentation (Day 7)
-   - Acceptance test suite
-   - Migration guide
-   - Example workflows
-
----
-
-## Success Metrics
-
-- All v1.0 workflows continue to run unchanged
-- Inbox processing handles 100+ tasks sequentially
-- Status files provide full execution visibility
-- Zero auto-magic path mutations
-- < 200 additional lines of code for v1.1 features
-
----
-
-END OF SPECIFICATION v1.1
