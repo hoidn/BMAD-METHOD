@@ -72,8 +72,8 @@ task_extension: ".task"
 orchestrate run workflows/demo.yaml \
   --context key=value \
   --context-file context.json \
-  --clean-processed \           # NEW: Empty processed/ before run
-  --archive-processed output.zip # NEW: Archive processed/ on success
+  --clean-processed \           # Empty processed/ before run
+  --archive-processed output.zip # Archive processed/ on success
 
 # Resume failed/interrupted run (v1.0 behavior preserved)
 orchestrate resume <run_id>
@@ -89,12 +89,9 @@ orchestrate watch workflows/demo.yaml
 
 ---
 
-## Variable Model (Simplified)
+## Variable Model
 
-### Removed Namespace
-- ~~`${env.*}`~~ - **REMOVED** for security and simplicity
-
-### Retained Namespaces (precedence order)
+### Namespaces (precedence order)
 1. **Run Scope**
    - `${run.timestamp_utc}` - The start time of the run, formatted as YYYYMMDDTHHMMSSZ
 
@@ -191,16 +188,16 @@ steps:
 ### New Fields
 
 ```yaml
-# Agent label (optional, for documentation)
-agent: "engineer"  # The agent field is an informational label for documentation and observability; it does not affect path resolution or any other execution behavior.
+# Agent label (optional)
+agent: "engineer"  # Informational label only; doesn't affect path resolution
 
 # Output capture mode
 output_capture: "text"  # Default: text | lines | json
 
 # Dynamic for-each from prior step
 for_each:
-  items_from: "steps.CheckInbox.lines"  # NEW: Reference array from prior step
-  # OR traditional literal:
+  items_from: "steps.CheckInbox.lines"  # Reference array from prior step
+  # OR literal array:
   items: ["a", "b", "c"]
   as: item
   steps: [...]
@@ -209,14 +206,14 @@ for_each:
 allow_parse_error: false
 
 # Provider specification
-provider: "claude"  # Claude Code CLI
+provider: "claude"
 provider_params:
-  model: "claude-3-5-sonnet"  # Optional: claude-3-5-haiku, claude-3-opus-latest
+  model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
 
 # Command override (NEW)
 command_override: ["claude", "-p", "Custom prompt"]
 
-# Wait for files (NEW) - blocking primitive for inter-agent communication
+# Wait for files (blocking primitive for inter-agent communication)
 wait_for:
   glob: "inbox/engineer/replies/*.task"  # File pattern to watch
   timeout_sec: 1800                      # Max wait time (default: 300)
@@ -267,7 +264,7 @@ Parse failure → exit code 2 unless `allow_parse_error: true`
 
 ## Provider Execution Model
 
-### Input/Output Contract (REVISED)
+### Input/Output Contract
 
 When a step specifies both `provider` and `input_file`:
 
@@ -460,14 +457,12 @@ steps:
       items_from: "steps.CheckEngineerInbox.lines"
       as: task_file
       steps:
-        - name: ReadTask
-          command: ["cat", "${task_file}"]
-          output_file: "current_task.txt"
-          
         - name: ImplementWithClaude
           agent: "engineer"
           provider: "claude"
-          input_file: "inbox/engineer/${task_file}"  # More realistic: reading from inbox
+          provider_params:
+            model: "claude-3-5-sonnet"
+          input_file: "${task_file}"  # task_file is already a full path from find
           output_file: "artifacts/engineer/execution_log_${loop.index}.md"  # Captures STDOUT
           # Note: Claude will create implementation files directly based on prompt instructions
           
@@ -484,8 +479,10 @@ steps:
             equals:
               left: "${steps.WriteStatus.json.success}"
               right: "true"
-          command: ["echo", "Review impl_${loop.index}.py"]
-          output_file: "inbox/qa/review_${loop.index}.task"
+          command: ["bash", "-c", "
+            echo 'Review impl_${loop.index}.py' > inbox/qa/review_${loop.index}.tmp &&
+            mv inbox/qa/review_${loop.index}.tmp inbox/qa/review_${loop.index}.task
+          "]
 
   - name: NoTasks
     command: ["echo", "No pending tasks"]
@@ -524,19 +521,20 @@ steps:
     # Executes as:
     # claude -p "Create a system architecture..." --model claude-3-5-sonnet > artifacts/architect/log.md
     
-  # Step 2: Compose dynamic task for Agent B
+  # Step 2: Compose dynamic task for Agent B (atomic write)
   - name: PrepareEngineerTask
     command: ["bash", "-c", "
-      echo 'Implement the following designs:' > inbox/engineer/task.md &&
-      echo '' >> inbox/engineer/task.md &&
-      cat artifacts/architect/*.md >> inbox/engineer/task.md
+      echo 'Implement the following designs:' > inbox/engineer/task_${run.timestamp_utc}.tmp &&
+      echo '' >> inbox/engineer/task_${run.timestamp_utc}.tmp &&
+      cat artifacts/architect/*.md >> inbox/engineer/task_${run.timestamp_utc}.tmp &&
+      mv inbox/engineer/task_${run.timestamp_utc}.tmp inbox/engineer/task_${run.timestamp_utc}.task
     "]
     
   # Step 3: Agent B processes dynamic task
   - name: EngineerImplement
     agent: "engineer"
     provider: "claude"
-    input_file: "inbox/engineer/task.md"  # Dynamically composed
+    input_file: "inbox/engineer/task_${run.timestamp_utc}.task"  # Dynamically composed
 ```
 
 ### Best Practices
