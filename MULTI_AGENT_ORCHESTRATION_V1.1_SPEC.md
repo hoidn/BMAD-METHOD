@@ -28,6 +28,82 @@ workspace/
 
 Path Resolution Rule: All user-declared paths remain explicit and resolve against WORKSPACE. No auto-prefixing based on agent.
 
+### Run Identity and State Management
+
+#### Run Identification
+- **run_id format**: `YYYYMMDDTHHMMSSZ-<6char>` (timestamp + random suffix)
+- **RUN_ROOT**: `.orchestrate/runs/${run_id}` under WORKSPACE
+- **State persistence**: All run data stored under RUN_ROOT
+
+#### State File Schema
+
+The state file (`${RUN_ROOT}/state.json`) is the authoritative record of execution:
+
+```json
+{
+  "schema_version": "1.1.1",
+  "run_id": "20250115T143022Z-a3f8c2",
+  "workflow_file": "workflows/pipeline.yaml",
+  "workflow_checksum": "sha256:abcd1234...",
+  "started_at": "2025-01-15T14:30:22Z",
+  "updated_at": "2025-01-15T14:35:47Z",
+  "status": "running",  // running | completed | failed | suspended
+  "context": {
+    "key": "value"
+  },
+  "steps": {
+    "StepName": {
+      "status": "completed",
+      "exit_code": 0,
+      "started_at": "2025-01-15T14:30:23Z",
+      "completed_at": "2025-01-15T14:30:25Z",
+      "duration_ms": 2145,
+      "output": "...",
+      "truncated": false,
+      "debug": {
+        "command": ["echo", "hello"],
+        "cwd": "/workspace",
+        "env_count": 42
+      }
+    }
+  },
+  "for_each": {
+    "ProcessItems": {
+      "items": ["file1.txt", "file2.txt"],
+      "completed_indices": [0],
+      "current_index": 1
+    }
+  }
+}
+```
+
+#### State Integrity
+
+**Corruption Detection:**
+- State file includes `workflow_checksum` to detect workflow modifications
+- Each state update atomically writes to `.state.json.tmp` then renames
+- Malformed JSON or schema violations trigger recovery mode
+
+**Recovery Mechanisms:**
+```bash
+# Resume with state validation
+orchestrate resume <run_id>  # Validates and continues
+
+# Force restart ignoring corrupted state
+orchestrate resume <run_id> --force-restart  # Creates new state
+
+# Attempt repair of corrupted state
+orchestrate resume <run_id> --repair  # Best-effort recovery
+
+# Archive old runs
+orchestrate clean --older-than 7d  # Remove old run directories
+```
+
+**State Backup:**
+- Before each step execution: `cp state.json state.json.step_${step_name}.bak`
+- Keep last 3 backups per run (rotating)
+- On corruption, attempt rollback to last valid backup
+
 ### Task Queue System
 
 Writing Tasks:
@@ -72,6 +148,45 @@ orchestrate watch workflows/demo.yaml
 ```
 
 Safety: The `--clean-processed` flag will only operate on the `WORKSPACE/processed/` directory and will refuse to run on any other path. The `--archive-processed` destination path must be outside of the `processed/` directory. If a destination is not provided, the archive defaults to `RUN_ROOT/processed.zip`.
+
+### Extended CLI Options
+
+#### Debugging and Recovery Flags
+
+```bash
+# Debug and observability
+--debug                 # Enable debug logging
+--progress              # Show real-time progress
+--trace                 # Include trace IDs in logs
+--dry-run              # Validate without execution
+
+# State management
+--force-restart        # Ignore existing state
+--repair               # Attempt state recovery
+--backup-state         # Force state backup before each step
+--state-dir <path>     # Override default .orchestrate/runs
+
+# Error handling
+--on-error stop|continue|interactive  # Error behavior
+--max-retries <n>      # Retry failed steps (default: 0)
+--retry-delay <ms>     # Delay between retries
+
+# Output control  
+--quiet                # Minimal output
+--verbose              # Detailed output
+--json                 # JSON output for tooling
+--log-level debug|info|warn|error
+```
+
+#### Environment Variables
+
+```bash
+# Override defaults
+ORCHESTRATE_DEBUG=1              # Same as --debug
+ORCHESTRATE_STATE_DIR=/tmp/runs # Custom state location
+ORCHESTRATE_LOG_LEVEL=debug     # Default log level
+ORCHESTRATE_KEEP_RUNS=30         # Days to keep old runs
+```
 
 ## Variable Model
 
@@ -456,6 +571,53 @@ If `instruction` is not specified, the orchestrator uses context-appropriate def
 5. **Position**: 
    - `prepend`: Injection appears before original prompt content
    - `append`: Injection appears after original prompt content
+6. **Injection Target**: Injection modifies the in-memory prompt passed to the provider; the input_file on disk is not changed
+
+##### Size Limits and Truncation
+
+**Rationale:** The 256 KiB cap prevents memory exhaustion while accommodating typical use cases (100+ file paths or several configuration files).
+
+**Truncation Behavior:**
+
+In **list mode:**
+```
+Review these files:
+- file1.md
+- file2.md
+...
+- file99.md
+[... 47 more files truncated (312 KiB total)]
+```
+
+In **content mode:**
+```
+=== File: config.yaml (45 KiB) ===
+[content]
+
+=== File: data.json (180 KiB) ===
+[partial content]
+[... truncated: 125 KiB of 180 KiB shown]
+
+=== Files not shown (5 files, 892 KiB) ===
+- archived/old1.json (201 KiB)
+- archived/old2.json (189 KiB)
+[... 3 more files]
+```
+
+**Truncation Record:**
+When truncation occurs, state.json records:
+```json
+{
+  "injection_truncated": true,
+  "truncation_details": {
+    "total_size": 524288,
+    "shown_size": 262144,
+    "files_shown": 2,
+    "files_truncated": 1,
+    "files_omitted": 5
+  }
+}
+```
 
 #### Migration Notes
 
@@ -568,6 +730,86 @@ Exit code mapping:
 Default path: `artifacts/<agent>/status.json` or `status_<step>.json`
 
 Path Convention: All file paths included within a status JSON file (e.g., in the `outputs` array) must be relative to the WORKSPACE directory.
+
+## Debugging and Observability
+
+### Debug Mode
+
+Enable comprehensive logging with `--debug` flag:
+
+```bash
+orchestrate run workflow.yaml --debug
+```
+
+Debug mode captures:
+- Variable substitution traces
+- Dependency resolution details  
+- Command construction logs
+- Environment variable snapshot
+- File operation details
+
+### Execution Logs
+
+Each run creates structured logs:
+
+```
+${RUN_ROOT}/
+├── state.json           # Authoritative state
+├── logs/
+│   ├── orchestrator.log # Main execution log
+│   ├── StepName.stdout  # Step stdout (if >8KB or JSON parse error)
+│   ├── StepName.stderr  # Step stderr (always if non-empty)
+│   └── StepName.debug   # Debug info (if --debug)
+└── artifacts/          # Step-created files
+```
+
+### Error Context
+
+On step failure, the orchestrator records:
+
+```json
+{
+  "error": {
+    "message": "Command failed with exit code 1",
+    "exit_code": 1,
+    "stdout_tail": ["last", "10", "lines"],
+    "stderr_tail": ["error", "messages"],
+    "context": {
+      "undefined_vars": ["${context.missing}"],
+      "failed_deps": ["data/required.csv"],
+      "substituted_command": ["cat", "data/file_20250115.csv"]
+    }
+  }
+}
+```
+
+### Observability Features
+
+**Progress Reporting:**
+```bash
+# Real-time progress
+orchestrate run workflow.yaml --progress
+
+# Output:
+[2/5] ProcessData: Running (15s)...
+  └─ for_each: [3/10] Processing item3.csv
+```
+
+**Metrics Collection:**
+State file includes timing for performance analysis:
+- Step duration
+- Queue wait time (for wait_for steps)
+- Provider execution time
+- File I/O operations
+
+**Trace Context:**
+Each step can emit trace IDs for correlation with external systems:
+```yaml
+steps:
+  - name: CallAPI
+    env:
+      TRACE_ID: "${run.id}-${steps.index}"
+```
 
 ## Example: Multi-Agent Inbox Processing
 
@@ -876,6 +1118,48 @@ steps:
         - "data/important.csv"
       inject: false  # Or omit inject entirely
     # Prompt must manually reference the files
+```
+
+---
+
+## Example: Debugging Failed Runs
+
+```yaml
+version: "1.1"
+name: "debugging_example"
+
+steps:
+  - name: ProcessWithDebug
+    command: ["python", "process.py"]
+    env:
+      DEBUG: "${ORCHESTRATE_DEBUG:-0}"  # Inherit debug flag
+    on:
+      failure:
+        goto: DiagnoseFailure
+        
+  - name: DiagnoseFailure
+    command: ["bash", "-c", "
+      echo 'Checking failure context...' &&
+      cat ${RUN_ROOT}/logs/ProcessWithDebug.stderr &&
+      jq '.steps.ProcessWithDebug.error' ${RUN_ROOT}/state.json
+    "]
+```
+
+### Investigating Failures
+
+```bash
+# Run with debugging
+orchestrate run workflow.yaml --debug
+
+# On failure, check logs
+cat .orchestrate/runs/latest/logs/orchestrator.log
+
+# Examine state
+jq '.steps | map_values({status, exit_code, error})' \
+  .orchestrate/runs/latest/state.json
+
+# Resume after fixing issue
+orchestrate resume 20250115T143022Z-a3f8c2 --debug
 ```
 
 ---

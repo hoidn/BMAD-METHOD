@@ -38,6 +38,24 @@ Implementation target: Node.js (>=20), plain JS with JSDoc types or TypeScript e
 
 - Path resolution rule: Use literal paths provided in workflow; resolve against WORKSPACE; no agent-based auto-prefixing.
 
+## 2a) Architectural Decisions (ADRs)
+
+- ADR-01 Filesystem as Source of Truth and Path Safety
+  - All state, artifacts, and inter-agent communication live in the filesystem under WORKSPACE.
+  - Reject absolute paths and any path containing `..` during validation.
+  - Follow symlinks, but if the resolved real path would escape WORKSPACE, reject the path.
+  - Enforce these rules at load/validation time and before any filesystem operation.
+
+- ADR-02 Declarative YAML, Sequential Execution
+  - YAML defines the workflow; the engine executes one step at a time, deterministically.
+
+- ADR-03 Provider as Managed Black Box (with assumed side effects)
+  - Explicit contract: orchestrator constructs argv, passes prompt as a single CLI argument, injects env/secrets, captures stdout/stderr/exit code.
+  - Implicit contract: providers may read/write workspace files as side effects; subsequent steps and `depends_on` validate these effects.
+
+- ADR-04 Authoritative JSON Run State
+  - `state.json` is authoritative; update after every step attempt to support resumability and auditability.
+
 
 ## 3) High-level System Architecture
 
@@ -101,7 +119,8 @@ src/
     runState.ts              # in-memory model + read/write/backup/repair
     persistence.ts           # atomic write helpers, checksum
   exec/
-    stepExecutor.ts          # command building, process spawn, capture
+    runner.ts                # low-level process spawn, env/secrets, timeouts
+    stepExecutor.ts          # command construction, uses runner + outputCapture
     outputCapture.ts         # text/lines/json parse, truncation, spill
     retry.ts                 # retry policy helpers
   providers/
@@ -239,7 +258,7 @@ interface StepErrorContext {
 }
 
 interface StepResultBase {
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
   exit_code?: number;
   started_at?: string;
   completed_at?: string;
@@ -301,6 +320,7 @@ interface StatusJsonV1 {
 3. Create run_id and initialize state.json; or load/validate existing on `resume`.
 4. For each top-level step index i:
    - Evaluate `when.equals` if present. If false, mark skipped as completed (exit_code 0) and continue.
+     - Default semantics: mark step `status: 'skipped'` when the condition is false (no process execution).
    - If `wait_for` present: run wait loop, record metrics and result, handle timeout (exit 124) and `on.failure`.
    - If `for_each` present: resolve items via pointer or literal; persist into state; iterate items:
      - Set loop variables (`item`, `loop.index`, `loop.total`).
@@ -313,6 +333,9 @@ interface StatusJsonV1 {
      - Redirect stdout to `output_file` if specified; still capture for state (truncated rules apply).
      - Record timings, exit_code; apply retries if configured; update state atomically after each attempt.
    - Apply branching (`on.success`/`on.failure` goto). If goto taken, set i accordingly; else proceed sequentially.
+   - Control flow defaults:
+     - `strict_flow` default true: any non-zero exit halts the run unless an `on.failure.goto` is defined for that step.
+     - `_end` is a reserved target that terminates the run successfully.
 5. On success, optionally `--archive-processed` zip processed/ to `RUN_ROOT/processed.zip` (or provided path).
 6. Update global run status to completed/failed; finalize logs.
 
@@ -326,6 +349,7 @@ interface StatusJsonV1 {
   - Undefined variables: error and halt with exit code 2. Flag `--undefined-as-empty` downgrades to empty string with warning.
   - Type coercion in conditions: compare as strings; JSON numbers are stringified.
   - Escape syntax: treat `$$` as a single literal `$`. To render `${`, write `$${`.
+  - Disallow `${env.*}` namespace in workflows; loader rejects such references.
 
 
 ## 8) Provider Integration
@@ -340,6 +364,10 @@ interface StatusJsonV1 {
 - Input handling: if `input_file`, read contents to PROMPT after optional dependency injection; pass as CLI argument (not stdin).
 - Output handling: if `output_file`, redirect child stdout to that file while still capturing for state until size limits.
 - Exit codes: 0 success; 1 retryable API error; 2 invalid input/non-retryable; 124 timeout (retryable).
+
+Contracts (summary):
+- Command construction precedence is enforced; template interpolation errors surface as `MissingTemplateKeyError` and map to exit code 2 at the step level.
+- Prompt handling is in-memory: `input_file` contents are read, optional dependency injection applies, then the composed prompt is passed via argv as `${PROMPT}`.
 
 
 ## 9) Dependency Validation & Injection
@@ -366,6 +394,11 @@ interface StatusJsonV1 {
     ```
   - No modification to source `input_file`; the composed prompt string is passed to provider argv.
 
+Contracts (summary):
+- Validate required and optional patterns after variable substitution; use POSIX globs (`*` and `?`). Do not support `**` (globstar).
+- Missing required → non-retryable validation error mapped to exit code 2; optional missing → proceed without warning unless `--verbose`.
+- Injection modifies only the in-memory prompt composition; never edits files on disk.
+
 
 ## 10) Wait / Queue Semantics
 
@@ -378,6 +411,12 @@ interface StatusJsonV1 {
   - On success: `mv <task> processed/{timestamp}/` (create dir as needed)
   - On non-retryable failure: `mv <task> failed/{timestamp}/`
 
+Inter‑Agent Example (worked):
+- Architect step prompts provider to write `artifacts/architect/system_design.md`.
+- A subsequent bash step lists architect artifacts and writes `inbox/engineer/task_X.tmp` → rename to `.task`.
+- Engineer step requires `artifacts/architect/system_design.md`; with `depends_on.inject: true`, the orchestrator prepends a file list to the in-memory prompt before invoking the provider.
+- Engineer produces code; orchestrator writes a QA review task to `inbox/qa/` and optionally waits for feedback with `wait_for` on `inbox/engineer/*.task`.
+
 
 ## 11) Observability & Logs
 
@@ -388,7 +427,7 @@ interface StatusJsonV1 {
   - `StepName.debug` (when `--debug`)
 - Progress UI (when `--progress`): `[n/N] StepName: Running (Xs)...` with for-each progress `[i/total]`.
 - JSON output mode (`--json`): stream machine-readable updates to stdout (optional enhancement).
-- Secrets masking: redact values of `secrets` env names in logs and command echoes.
+- Secrets masking: redact values of `secrets` env names in logs and command echoes, including real-time masking for streamed output.
 
 
 ## 12) Error Handling & Retry
@@ -405,6 +444,10 @@ interface StatusJsonV1 {
 - Before each step, if `--backup-state` (or always per spec recommendation): copy `state.json` → `state.json.step_<step>.bak` (keep last 3).
 - On corruption: `resume --repair` attempts last valid backup; `resume --force-restart` starts new run (new run_id); always validate checksum.
 - `clean --older-than 7d` removes old run directories; `--state-dir` can override default base path.
+
+Contracts (summary):
+- Persist `state.json` after every step attempt (success or failure) to enable deterministic resume.
+- On parse or write failure, do not partially overwrite: use tmp + atomic rename.
 
 
 ## 14) CLI Contract & Safety Rails
@@ -497,8 +540,8 @@ interface StatusJsonV1 {
 
 ## 19) Security & Safety
 
-- Secrets handling: only pass env vars named in `secrets`; never print values; mask in logs.
-- Path safety: normalize and ensure all workflow-relative paths remain within WORKSPACE tree for operations that modify files created by orchestrator; do not silently operate outside unless explicitly configured.
+- Secrets handling: only pass env vars named in `secrets`; never print values; mask in logs (including streamed output).
+- Path safety: enforce ADR-01 rules strictly—reject absolute or `..` paths; follow symlinks but reject if resolution escapes WORKSPACE; validate at load time and before FS ops.
 - Clean/archive safeguards strictly enforced per spec.
 
 
@@ -508,6 +551,7 @@ interface StatusJsonV1 {
 - Avoid modifying input files during injection; always compose in-memory prompt string.
 - Ensure state updates are granular: write after each step attempt to support robust resumes.
 - Preserve compatibility with future v2 caching by being explicit about dependencies in state for each step.
+- Testability: design for dependency injection—wire Engine with pluggable StateManager, StepExecutor, and Runner to ease unit testing and mocking.
 
 
 ## 21) Appendix — Main Run Loop Sketch
@@ -531,4 +575,3 @@ async function run(workflowPath: string, opts: CliOptions) {
 ```
 
 This architecture maps 1:1 with the v1.1 spec and provides enough structure for a junior engineer to start implementing modules in order, with clear interfaces and well-defined behaviors.
-

@@ -20,6 +20,11 @@ Modern LLM-based agent systems require a robust mechanism to execute sequences o
 
 **Decision:** The filesystem is the primary medium for state, artifacts, and inter-agent communication. We will use a structured directory layout (`inbox/`, `artifacts/`, `processed/`, etc.) instead of a database, message queue, or in-memory data store.
 
+Path Resolution Rule:
+- All workflow-declared paths resolve against WORKSPACE (the orchestrator CWD).
+- Absolute paths and any path containing `..` are rejected.
+- Symlinks are followed, but if resolution would escape WORKSPACE, the path is rejected.
+
 **Rationale:**
 *   **Transparency:** Any developer can inspect the state of the system using standard tools (`ls`, `cat`, `find`). This drastically simplifies debugging.
 *   **Simplicity:** It removes the need for additional infrastructure (databases, brokers), making the system lightweight and easy to set up.
@@ -51,8 +56,8 @@ Modern LLM-based agent systems require a robust mechanism to execute sequences o
 *   **Extensibility:** Any tool that can be invoked from a command line can be integrated as a provider without changing the orchestrator's code.
 *   **Isolation:** The orchestrator is isolated from the internal complexities and dependencies of the tools it runs.
 *   **Refined Contract ("Managed Black Box with Assumed Side Effects"):**
-    1.  **Explicit Contract:** The orchestrator directly manages command-line invocation, `stdout`/`stderr`/`exit_code` capture, and environment variable injection.
-    2.  **Implicit Contract:** The orchestrator *assumes* providers have the capability to produce **filesystem side effects** (reading/writing files) based on their inputs. It validates these side effects using `depends_on` checks and subsequent steps.
+    1.  **Explicit Contract:** The orchestrator directly manages command-line invocation, `stdout`/`stderr`/`exit_code` capture, and environment variable injection. Prompts are passed as a single CLI argument (argv), not via STDIN.
+    2.  **Implicit Contract:** The orchestrator *assumes* providers can read/write files as side effects. It validates these side effects using `depends_on` checks and subsequent steps.
 
 ### ADR-05: Explicit JSON State for Resumability
 
@@ -89,16 +94,9 @@ module orchestrator.models.workflow {
     struct OnHandlers {
         success: optional GotoAction;
         failure: optional GotoAction;
-        always: optional GotoAction;
     }
     
-    // --- Typed struct for prompt transport ---
-    struct PromptTransport {
-        mode: string; // "argv" | "stdin" | "temp_file"
-        argv_template: optional string; // e.g., "-p"
-    }
-
-    // --- Existing structs ---
+    // --- Typed struct for injection config ---
     struct InjectConfig {
         mode: string; // "list" | "content" | "none"
         instruction: optional string;
@@ -123,7 +121,7 @@ module orchestrator.models.workflow {
         defaults: optional dict<string, Any>;
     }
 
-    // --- UPDATED: Step struct with new types ---
+    // --- Step struct with spec-aligned fields ---
     struct Step {
         name: string;
         agent: optional string;
@@ -139,7 +137,13 @@ module orchestrator.models.workflow {
         when: optional WhenClause;
         env: optional dict<string, string>;
         secrets: optional list<string>;
-        prompt_transport: optional PromptTransport;
+        // Spec-aligned IO:
+        // - input_file: When set with a provider, the orchestrator reads the file contents
+        //   and passes the prompt text as a single CLI argument to the provider.
+        // - output_file: When set, the orchestrator redirects provider STDOUT to this file
+        //   while also applying the configured output_capture for state.
+        input_file: optional string;
+        output_file: optional string;
     }
 
     struct Workflow {
@@ -158,6 +162,12 @@ module orchestrator.models.workflow {
 # @depends_on(orchestrator.models.workflow)
 module orchestrator.models.state {
 
+    struct WaitState {
+        files: list<string>;
+        wait_duration: int; // milliseconds
+        poll_count: int;
+    }
+
     struct StepResult {
         step_name: string;
         status: string; // "succeeded" | "failed" | "skipped"
@@ -165,10 +175,14 @@ module orchestrator.models.state {
         start_time: string; // ISO 8601 format
         end_time: string;   // ISO 8601 format
         duration: float;    // in seconds
+        // Note: when output_capture is 'lines' or 'json', omit 'output' in state.
         output: optional string;
         lines: optional list<string>;
-        json_data: optional Any;
+        json: optional Any;
         truncated: boolean;
+        parse_error: optional boolean; // for json mode with allow_parse_error
+        stdout_log: optional string;   // spill/log path under RUN_ROOT/logs
+        wait: optional WaitState;      // populated when step used wait_for
     }
 
     struct RunState {
@@ -199,6 +213,8 @@ module orchestrator.parsing.loader {
         // - Reads a YAML file from the filesystem.
         // - Deserializes the YAML content.
         // - Validates the deserialized data against the Workflow data contract.
+        // - Validates that disallowed namespaces (e.g., ${env.*}) are not present.
+        // - Validates pointer grammar for `for_each.items_from` to ensure it targets an array.
         // @raises_error(condition="FileNotFound", description="Raised if the workflow file does not exist.")
         // @raises_error(condition="YamlParseError", description="Raised if the file content is not valid YAML.")
         // @raises_error(condition="WorkflowValidationError", description="Raised if YAML does not match the required structure.")
@@ -246,11 +262,12 @@ module orchestrator.context.variables {
         //    - `${context.<key>}`
         //
         // Pointer Grammar:
-        // - For `steps.<StepName>.json`, dot-notation is supported to access nested values (e.g., `${steps.MyStep.json.result.files[0]}`).
-        // - Wildcards or advanced query expressions are NOT supported.
+        // - For `steps.<StepName>.json`, dot-notation is supported to access nested values (e.g., `${steps.MyStep.json.result.files}`) that resolve to arrays when used in `for_each.items_from`.
+        // - Wildcards, array indexing, or advanced expressions are NOT supported in pointers.
         //
         // Error Conditions:
         // - The `${env.*}` namespace is explicitly disallowed and will raise an error.
+        // - Unresolved placeholders raise UndefinedVariableError and halt execution (fail-fast).
         //
         // @raises_error(condition="UndefinedVariableError", description="Raised if a placeholder cannot be resolved in any namespace. Execution halts.")
         string substitute(string text, optional Any loop_item, optional int loop_index);
@@ -281,8 +298,7 @@ module orchestrator.execution.runner {
         // - Sets the specified environment variables.
         // - Captures stdout and stderr streams.
         // - Masks any values from `secrets_to_mask` in the real-time logged output.
-        // - Enforces the specified timeout.
-        // @raises_error(condition="TimeoutExpired", description="Raised if the command exceeds its execution time limit.")
+        // - Enforces the specified timeout; on timeout, terminates the process and returns exit_code 124 (retryable).
         CommandResult run_command(list<string> command, dict<string, string> env, list<string> secrets_to_mask, int timeout_sec);
     }
 }
@@ -293,10 +309,12 @@ module orchestrator.execution.runner {
 module orchestrator.execution.output {
     
     struct ProcessedOutput {
-        output: optional string;
-        lines: optional list<string>;
-        json_data: optional Any;
-        truncated: boolean;
+        output: optional string;      // text mode: first 8 KiB stored; >1 MiB spills to log
+        lines: optional list<string>; // lines mode: max 10,000 lines
+        json: optional Any;           // json mode: parsed object when within 1 MiB
+        truncated: boolean;           // true when spill/truncation occurred
+        parse_error: optional boolean; // json mode with allow_parse_error=true
+        stdout_log: optional string;   // path to spilled stdout under RUN_ROOT/logs
     }
 
     interface OutputProcessor {
@@ -305,11 +323,13 @@ module orchestrator.execution.output {
         // postconditions:
         // - Returns a ProcessedOutput struct populated according to the specified mode.
         // behavior:
-        // - 'text': Stores stdout, applying truncation logic.
-        // - 'lines': Splits stdout into a list of strings, applying truncation logic.
-        // - 'json': Parses stdout as a JSON object.
-        // @raises_error(condition="JsonParseError", description="Raised if mode is 'json', stdout is not valid JSON, and allow_parse_error is false.")
-        // @raises_error(condition="OutputTooLargeError", description="Raised if stdout exceeds parsing limits for a given mode.")
+        // - 'text': Store up to 8 KiB of stdout in state. If total stdout > 1 MiB, spill full stdout to RUN_ROOT/logs and set truncated=true and stdout_log.
+        // - 'lines': Split into lines, store first 10,000 entries; if more, set truncated=true.
+        // - 'json': Buffer up to 1 MiB; parse as JSON. If buffer exceeds limit or parsing fails:
+        //     * if allow_parse_error=false: raise JsonParseError (caller maps to exit code 2).
+        //     * if allow_parse_error=true: set parse_error=true, json omitted, and spill raw stdout to RUN_ROOT/logs.
+        // Note: when mode is 'lines' or 'json', callers must omit 'output' from StepResult to avoid duplication.
+        // @raises_error(condition="JsonParseError", description="Raised if mode is 'json' and parsing fails with allow_parse_error=false.")
         ProcessedOutput process(string stdout, string mode, boolean allow_parse_error);
     }
 }
@@ -332,8 +352,9 @@ module orchestrator.execution.dependencies {
         // - If validation fails, an error is raised.
         // behavior:
         // - First, resolves any variables in the `required` and `optional` path patterns.
-        // - Checks for the existence of all files matching the resolved `required` patterns.
-        // - If `inject` is enabled, it resolves file paths/content and prepends or appends it to `prompt_content` according to the injection mode.
+        // - Pattern syntax supports '*', '?', and '**' (globstar) for recursive matching.
+        // - Checks for the existence of all files matching the resolved `required` patterns; zero matches produce a validation error.
+        // - If `inject` is enabled, it resolves file paths/content and prepends or appends it to `prompt_content` according to the injection mode. Injection modifies the in-memory prompt only; input files on disk are unchanged.
         // @raises_error(condition="DependencyNotFoundError", description="Raised if a 'required' file pattern matches no existing files.")
         string validate_and_inject(orchestrator.models.workflow.DependsOn depends_on, orchestrator.context.variables.VariableManager var_manager, string prompt_content);
     }
@@ -374,11 +395,9 @@ module orchestrator.execution.executor {
         //   2. The template is interpolated using a map of parameters with the following precedence:
         //      a. Step-level `provider_params` (highest precedence).
         //      b. Provider-level `defaults`.
-        //   3. The orchestrator provides special runtime variables for the template:
-        //      - `${PROMPT}`: The final prompt content (after dependency injection).
-        //      - `${INPUT_FILE}`: The path to the step's `input_file`.
-        //      - `${OUTPUT_FILE}`: The path to the step's `output_file`.
-        //   4. The final prompt content is transported to the subprocess according to the `prompt_transport` setting (defaulting to `argv` via a `-p` style flag).
+        //   3. The orchestrator provides `${PROMPT}` as the final prompt content (after dependency injection). Prompts are passed as a single CLI argument (argv).
+        //   4. If `input_file` is set, its literal contents become the initial prompt content before dependency injection.
+        //   5. If `output_file` is set, STDOUT is redirected to that file during execution (OutputProcessor also applies capture limits for state).
         //
         // @raises_error(condition="MissingTemplateKeyError", description="Raised if the provider command template references a key not found in provider_params or defaults.")
         orchestrator.models.state.StepResult execute_step(orchestrator.models.workflow.Step step, orchestrator.context.variables.VariableManager var_manager);
@@ -402,8 +421,9 @@ module orchestrator.core.state {
         // - If resuming, returns the existing RunState loaded from the filesystem.
         // - If starting a new run, returns a new RunState object, initialized with run_id, workflow details, and initial context.
         // behavior:
-        // - For a resume operation (`run_id` is not null), it loads the state from '.runs/<run_id>/state.json'.
-        // - For a new run, it creates a new RunState instance, populating it with a new run_id and the provided workflow and context data.
+        // - RUN_ROOT is `.orchestrate/runs/${run_id}` under WORKSPACE.
+        // - For a resume operation (`run_id` is not null), it loads the state from `${RUN_ROOT}/state.json`.
+        // - For a new run, it creates a new RunState instance, with a new run_id and the provided workflow and context data.
         // @raises_error(condition="StateNotFound", description="Raised on resume if the state file for run_id does not exist.")
         // @raises_error(condition="StateCorrupted", description="Raised if the state file is invalid JSON or fails validation.")
         orchestrator.models.state.RunState load_or_create(optional string run_id, orchestrator.models.workflow.Workflow workflow, dict<string, Any> initial_context);
@@ -411,7 +431,7 @@ module orchestrator.core.state {
         // preconditions:
         // - `state` must be a valid RunState object.
         // postconditions:
-        // - The provided RunState is serialized to JSON and saved to '.runs/<run_id>/state.json'.
+        // - The provided RunState is serialized to JSON and saved to `${RUN_ROOT}/state.json`.
         // behavior:
         // - Persists the current state of the workflow run to the filesystem, enabling resume functionality.
         // @raises_error(condition="IOError", description="Raised if the state file cannot be written.")
@@ -447,8 +467,14 @@ module orchestrator.core.engine {
         // - The main control loop of the application.
         //   1. Initializes or loads the RunState.
         //   2. Determines the starting step (step 0 for new runs, the next un-executed step for resumes).
-        //   3. Iteratively executes steps using the StepExecutor.
-        //   4. Handles control flow logic (`goto`, `on.failure`, `for_each`, `when`).
+        //   3. Iteratively executes steps using the StepExecutor in listed order unless redirected by `goto`.
+        //   4. Handles control flow logic:
+        //      - Default progression: next listed step.
+        //      - `_end` is a reserved target that terminates the run successfully.
+        //      - `on.success.goto` when exit_code == 0; `on.failure.goto` when exit_code != 0 (including dependency/parse/timeouts).
+        //      - strict_flow (default true): any non-zero exit halts the run unless an `on.failure.goto` is defined for that step.
+        //      - `when`: if false, mark step as "skipped" without executing.
+        //      - `for_each`: resolve items once at start, persist to state for deterministic resume; execute indices in order.
         //   5. Updates the RunState after each step.
         //   6. Returns the final status of the run.
         string run(dict<string, Any> initial_context, optional string run_id);
@@ -469,9 +495,15 @@ module orchestrator.cli {
         // - The application exits with code 0 on success, non-zero on failure.
         // behavior:
         // - The main entry point of the application.
-        // - It parses all command-line arguments (`run`, `resume`, context flags, etc.).
-        // - It bootstraps all necessary components (Loader, StateManager, Engine, etc.).
-        // - It invokes the appropriate method on the Orchestrator engine.
+        // - Supports commands:
+        //   * `orchestrate run <workflow.yaml> [--context k=v ...] [--context-file file] [--clean-processed] [--archive-processed [dest.zip]]`
+        //   * `orchestrate resume <run_id>`
+        //   * `orchestrate run-step <step_name> --workflow <workflow.yaml>`
+        //   * `orchestrate watch <workflow.yaml>`
+        // - Safety:
+        //   * `--clean-processed` only operates on WORKSPACE/processed and refuses other paths.
+        //   * `--archive-processed` destination must be outside processed/; default to `${RUN_ROOT}/processed.zip` if omitted.
+        // - Bootstraps Loader, StateManager, Engine, and invokes the appropriate method.
         // - Handles top-level exceptions and translates them to user-friendly error messages and appropriate exit codes.
         void main();
     }
@@ -522,7 +554,9 @@ This flow illustrates how two agents, "Architect" and "Engineer," coordinate.
 *   **Observability:** All significant actions must be logged. Logs must automatically mask any values identified as secrets. The `state.json` file serves as a structured audit log.
 *   **Security:**
     *   **Secret Management:** Secrets are passed via environment variables and must never be logged or persisted in the state file.
-    *   **Filesystem Safety:** Operations like `--clean-processed` must contain safeguards to prevent execution on paths outside the designated `workspace`.
+    *   **Filesystem Safety:**
+        - Operations like `--clean-processed` must contain safeguards to prevent execution on paths outside `WORKSPACE/processed`.
+        - Enforce Path Resolution Rules (reject absolute paths and `..`; follow symlinks but prevent escaping WORKSPACE).
 
 ## 6. Future Considerations (Out of Scope)
 
