@@ -113,6 +113,64 @@ orchestrate watch workflows/demo.yaml
 4. **Context Variables**
    - `${context.<key>}` - Workflow-level variables
 
+### Variable Substitution Scope
+
+#### Where Variables Are Substituted
+
+Variables using the `${...}` syntax are substituted in:
+- **Command arrays**: `["echo", "${context.message}"]`
+- **File paths**: `"artifacts/${loop.index}/result.md"`
+- **Provider parameters**: `model: "${context.model_name}"`
+- **Conditional values**: `left: "${steps.Previous.output}"`
+
+#### Where Variables Are NOT Substituted
+
+- **File contents**: The contents of files referenced by `input_file`, `output_file`, or any other file parameters are passed as-is without variable substitution
+
+#### Dynamic Content Pattern
+
+To include dynamic content in files, use a pre-processing step:
+
+```yaml
+steps:
+  # Step 1: Create dynamic prompt with substituted variables
+  - name: PreparePrompt
+    command: ["bash", "-c", "echo 'Analyze ${context.project_name}' > temp/prompt.md"]
+    
+  # Step 2: Use the prepared prompt
+  - name: Analyze
+    provider: "claude"
+    input_file: "temp/prompt.md"  # Contains substituted content
+```
+
+**Future Enhancement:** Version 1.2 may introduce opt-in template processing via a `process_template: true` flag.
+
+### Edge Case Behavior
+
+The following behaviors are **implementation-defined** in v1.1 (standardization deferred to v2.0):
+
+#### Undefined Variables
+Implementations may choose to:
+- Substitute with empty string
+- Leave literal `"${undefined.var}"` in place
+- Raise an error and halt execution
+
+#### Type Coercion in Conditions
+When comparing values in `when` clauses:
+- String comparison semantics are implementation-defined
+- Behavior when comparing JSON numbers to string literals is implementation-defined
+
+#### Escape Syntax
+The method to output literal `"${"` in strings is implementation-defined.
+
+#### Recommendations for Portability
+
+To ensure workflows run consistently across implementations:
+- Always initialize variables before use via `context` or prior steps
+- Use explicit string values in conditions: `"true"` rather than boolean `true`
+- Avoid literal `"${"` in strings
+- Document implementation requirements if using edge cases
+
 ### Environment & Secrets
 
 **Per-step environment injection (not substitution):**
@@ -150,11 +208,10 @@ for_each:
 # Optional, only applies when output_capture: json
 allow_parse_error: false
 
-# Provider parameters (NEW)
-provider: "claude"
+# Provider specification
+provider: "claude"  # Claude Code CLI
 provider_params:
-  model: "claude-3-5-sonnet"
-  max_tokens: 2048
+  model: "claude-3-5-sonnet"  # Optional: claude-3-5-haiku, claude-3-opus-latest
 
 # Command override (NEW)
 command_override: ["claude", "-p", "Custom prompt"]
@@ -208,23 +265,103 @@ Parse failure → exit code 2 unless `allow_parse_error: true`
 
 ---
 
+## Provider Execution Model
+
+### Input/Output Contract (REVISED)
+
+When a step specifies both `provider` and `input_file`:
+
+1. **Input Handling**: The orchestrator reads `input_file` contents and passes them as a command-line argument to the provider
+2. **Output Handling**: If `output_file` is specified, STDOUT is redirected to that file
+3. **File contents passed literally**: The prompt text is passed as a CLI argument, not piped via STDIN
+
+**Example Execution:**
+```yaml
+steps:
+  - name: Analyze
+    provider: "claude"
+    input_file: "prompts/analyze.md"
+    output_file: "artifacts/analysis.md"
+
+# Orchestrator reads the file:
+PROMPT_CONTENT=$(cat prompts/analyze.md)
+
+# Then executes:
+claude -p "$PROMPT_CONTENT" --model claude-3-5-sonnet > artifacts/analysis.md
+#      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#      Prompt text as CLI arg + model selection
+```
+
+**Prompt Contents:**
+```markdown
+# prompts/analyze.md
+Analyze the system requirements and create a detailed architecture.
+Consider scalability, security, and maintainability.
+Read any files in artifacts/requirements/ for context.
+```
+
+**Key Benefits:**
+- **No duplication**: Prompt doesn't need to reference itself
+- **Natural prompts**: Write prompts as you normally would
+- **Provider flexibility**: Provider can still read other files mentioned IN the prompt
+- **Clean separation**: `input_file` = the prompt, other files = data the prompt references
+
+### Provider File Operations
+
+#### Concurrent File and Stream Output
+
+Providers can read and write files directly from/to the filesystem while also outputting to STDOUT. These capabilities coexist:
+
+1. **Direct File Operations**: Providers may create, read, or modify files anywhere in the workspace based on prompt instructions
+2. **STDOUT Capture**: The `output_file` parameter captures STDOUT (typically logs, status messages, or reasoning process)
+3. **Simultaneous Operation**: A provider invocation may write multiple files AND produce STDOUT output
+
+**Example:**
+```yaml
+steps:
+  - name: GenerateSystem
+    agent: "architect"
+    provider: "claude"
+    input_file: "prompts/design.md"
+    output_file: "artifacts/architect/execution_log.md"  # Captures STDOUT
+    # Provider may also create files directly:
+    # - artifacts/architect/system_design.md
+    # - artifacts/architect/api_spec.md
+    # - artifacts/architect/data_model.md
+```
+
+#### Security Considerations
+
+- Providers have unrestricted filesystem access within the workspace directory
+- Workflow authors must ensure prompts do not request operations outside the workspace
+- Future versions may introduce sandboxing options
+
+#### Best Practices
+
+- Use `output_file` to capture execution logs and agent reasoning for debugging
+- Design prompts to write primary outputs as files to appropriate directories
+- Use subsequent steps to discover and validate created files
+- Document expected file outputs in step comments for clarity
+
+---
+
 ## Provider Configuration
 
 ### Direct CLI Integration
+
+**Important:** The providers are Claude Code (`claude`), Gemini CLI (`gemini`), and similar tools - NOT raw API calls.
 
 **Workflow-level templates:**
 ```yaml
 providers:
   claude:
-    command: ["claude", "--model", "${model}", "--max-tokens", "${max_tokens}"]
+    command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
     defaults:
-      model: "claude-3-5-sonnet"
-      max_tokens: 4096
+      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
   
   gemini:
-    command: ["gemini", "--model", "${model}"]
-    defaults:
-      model: "gemini-pro"
+    command: ["gemini", "-p", "${PROMPT}"]
+    # Gemini CLI doesn't support model selection via CLI
 ```
 
 **Step-level usage:**
@@ -232,15 +369,21 @@ providers:
 steps:
   - name: Analyze
     provider: "claude"
-    provider_params:           # Override defaults
-      model: "claude-3-5-haiku"
-      max_tokens: 2048
+    provider_params:
+      model: "claude-3-5-sonnet"  # or claude-3-5-haiku for faster/cheaper
     input_file: "prompts/analyze.md"
     output_file: "artifacts/architect/analysis.md"
 
   - name: CustomProvider
-    command_override: ["claude", "-p", "Special prompt", "--model", "claude-3-5-sonnet"]
+    command_override: ["claude", "-p", "Special prompt", "--model", "claude-3-5-haiku"]
 ```
+
+**Note:** Claude Code is invoked with `claude -p "prompt" --model <model>`. Available models:
+- `claude-3-5-sonnet` (or `claude-3-5-sonnet-20241022`)
+- `claude-3-5-haiku` (or `claude-3-5-haiku-20241022`) - faster/cheaper
+- `claude-3-opus-latest` - most capable
+
+Model can also be set via `ANTHROPIC_MODEL` environment variable or `claude config set model`.
 
 **Exit code mapping (unchanged from v1.0):**
 - 0 = Success
@@ -296,10 +439,9 @@ strict_flow: true
 
 providers:
   claude:
-    command: ["claude", "--model", "${model}", "--max-tokens", "${max_tokens}"]
+    command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
     defaults:
-      model: "claude-3-5-sonnet"
-      max_tokens: 4096
+      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
 
 steps:
   # Check for pending engineer tasks
@@ -325,8 +467,9 @@ steps:
         - name: ImplementWithClaude
           agent: "engineer"
           provider: "claude"
-          input_file: "artifacts/engineer/current_task.txt"
-          output_file: "artifacts/engineer/impl_${loop.index}.py"
+          input_file: "inbox/engineer/${task_file}"  # More realistic: reading from inbox
+          output_file: "artifacts/engineer/execution_log_${loop.index}.md"  # Captures STDOUT
+          # Note: Claude will create implementation files directly based on prompt instructions
           
         - name: WriteStatus
           command: ["echo", '{"success": true, "task": "${task_file}"}']
@@ -353,6 +496,58 @@ steps:
 
 ---
 
+## Prompt Management Patterns
+
+### Directory Purpose Clarification
+
+- **`prompts/`**: Static, reusable prompt templates created by workflow authors before execution
+- **`inbox/`**: Dynamic task files for agent coordination, created during workflow execution
+- **`temp/`**: Temporary files for dynamic prompt composition and intermediate processing
+
+### Multi-Agent Coordination Pattern
+
+When agent B needs to process outputs from agent A:
+
+```yaml
+steps:
+  # Step 1: Agent A creates artifacts
+  - name: ArchitectDesign
+    agent: "architect"
+    provider: "claude"
+    input_file: "prompts/architect/design.md"  # Contains prompt text
+    output_file: "artifacts/architect/log.md"   # Captures STDOUT
+    
+    # prompts/architect/design.md contains:
+    # "Create a system architecture. Read requirements from artifacts/requirements/*.md
+    #  Write your design to artifacts/architect/system_design.md and api_spec.md"
+    
+    # Executes as:
+    # claude -p "Create a system architecture..." --model claude-3-5-sonnet > artifacts/architect/log.md
+    
+  # Step 2: Compose dynamic task for Agent B
+  - name: PrepareEngineerTask
+    command: ["bash", "-c", "
+      echo 'Implement the following designs:' > inbox/engineer/task.md &&
+      echo '' >> inbox/engineer/task.md &&
+      cat artifacts/architect/*.md >> inbox/engineer/task.md
+    "]
+    
+  # Step 3: Agent B processes dynamic task
+  - name: EngineerImplement
+    agent: "engineer"
+    provider: "claude"
+    input_file: "inbox/engineer/task.md"  # Dynamically composed
+```
+
+### Best Practices
+
+- Keep static templates generic (reference concepts, not specific files)
+- Build dynamic prompts at runtime to reference actual artifacts
+- Use `inbox/` for agent work queues to maintain clear task boundaries
+- Document the expected flow between agents in workflow comments
+
+---
+
 ## Migration from v1.0
 
 ### Breaking Changes
@@ -361,7 +556,7 @@ steps:
 ### New Features (backward compatible)
 - `output_capture: lines|json` for structured data
 - `items_from:` for dynamic iteration
-- Provider templates and `command_override`
+- Direct CLI providers (Claude Code, Gemini) and `command_override`
 - Status JSON files
 - Inbox/processed/failed directories
 - `wait_for:` blocking file wait primitive
