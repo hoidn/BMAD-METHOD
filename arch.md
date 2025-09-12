@@ -2,7 +2,7 @@
 
 Document version: 1.0
 Target spec: MULTI_AGENT_ORCHESTRATION_V1.1_SPEC.md
-Implementation target: Node.js (>=20), plain JS with JSDoc types or TypeScript equivalent
+Implementation target: Python (>=3.11). Interface/type blocks may use TypeScript-style for clarity; implement with Python dataclasses and runtime validation.
 
 ## 1) Goals & Non‑Goals
 
@@ -98,52 +98,65 @@ Implementation target: Node.js (>=20), plain JS with JSDoc types or TypeScript e
 ## 4) Module Structure (suggested)
 
 ```
-src/
+orchestrator/
   cli/
-    index.ts                 # commander wiring; routes to handlers
+    __init__.py
+    main.py                 # argparse/click wiring; routes to handlers
     commands/
-      run.ts
-      resume.ts
-      runStep.ts
-      watch.ts
-      clean.ts
+      __init__.py
+      run.py
+      resume.py
+      run_step.py
+      watch.py
+      clean.py
   config/
-    types.ts                 # CLI options, global config
-    defaults.ts
+    __init__.py
+    types.py                # CLI options, global config (typing/datataclasses)
+    defaults.py
   workflow/
-    loader.ts                # YAML load + schema validation + checksum
-    types.ts                 # Workflow, Step, Provider, Condition, DependsOn
-    pointers.ts              # steps.X.lines / steps.X.json.path resolution
-    substitution.ts          # variable interpolation (context/run/loop/steps)
+    __init__.py
+    loader.py               # YAML load + schema validation + checksum
+    types.py                # Workflow, Step, Provider, Condition, DependsOn
+    pointers.py             # steps.X.lines / steps.X.json.path resolution
+    substitution.py         # variable interpolation (context/run/loop/steps)
   state/
-    runState.ts              # in-memory model + read/write/backup/repair
-    persistence.ts           # atomic write helpers, checksum
+    __init__.py
+    run_state.py            # in-memory model + read/write/backup/repair
+    persistence.py          # atomic write helpers, checksum
   exec/
-    runner.ts                # low-level process spawn, env/secrets, timeouts
-    stepExecutor.ts          # command construction, uses runner + outputCapture
-    outputCapture.ts         # text/lines/json parse, truncation, spill
-    retry.ts                 # retry policy helpers
+    __init__.py
+    runner.py               # low-level process spawn, env/secrets, timeouts
+    step_executor.py        # command construction, uses runner + output_capture
+    output_capture.py       # text/lines/json parse, truncation, spill
+    retry.py                # retry policy helpers
   providers/
-    registry.ts              # register/get provider templates
-    types.ts                 # ProviderSpec, ProviderParams
+    __init__.py
+    registry.py             # register/get provider templates
+    types.py                # ProviderSpec, ProviderParams
   deps/
-    resolver.ts              # glob resolve, required/optional, errors
-    injector.ts              # list/content injection composition
+    __init__.py
+    resolver.py             # glob resolve, required/optional, errors
+    injector.py             # list/content injection composition
   fsq/
-    queue.ts                 # inbox read/write, processed/failed moves
-    wait.ts                  # wait_for polling with timeout
+    __init__.py
+    queue.py                # inbox read/write, processed/failed moves
+    wait.py                 # wait_for polling with timeout
   logging/
-    logger.ts                # levels, masking, trace IDs, progress
+    __init__.py
+    logger.py               # levels, masking, trace IDs, progress
   observe/
-    status.ts                # status JSON writer/validator
+    __init__.py
+    status.py               # status JSON writer/validator
   watch/
-    watcher.ts               # rerun on file changes (if implemented)
+    __init__.py
+    watcher.py              # rerun on file changes (if implemented)
   utils/
-    fs.ts, glob.ts, time.ts, json.ts, zip.ts, mask.ts
+    __init__.py
+    fs.py, glob.py, time.py, json.py, zip.py, mask.py
 ```
 
 
-## 5) Data Models (TypeScript-style)
+## 5) Data Models (TypeScript-style interfaces; implement with Python dataclasses)
 
 ### 5.1 Workflow spec
 
@@ -465,16 +478,17 @@ Contracts (summary):
 
 ## 15) Implementation Details & Libraries
 
-- Parsing & schema: `js-yaml`, minimal shape checks; enforce pointer grammar strings.
-- FS ops: `fs-extra` (atomic writes via tmp+rename), `glob` for POSIX patterns with symlink following.
-- CLI: `commander` for commands/flags; `chalk` for color; `ora` for progress.
-- Zipping: `archiver` or manual `zip` spawn (choose minimal dependency).
-- Time/IDs: use UTC ISO strings; run_id format `YYYYMMDDTHHMMSSZ-<6char>`.
+- Parsing & schema: `PyYAML` for YAML; minimal shape checks (pydantic or custom validators); enforce pointer grammar strings.
+- FS ops: `pathlib`, `os`, `shutil`, `tempfile`; POSIX globs via `glob`/`fnmatch`; follow symlinks with `pathlib.Path.resolve()` and validate WORKSPACE containment.
+- CLI: `argparse` (baseline) or `click` (optional); `rich` (optional) for progress output.
+- Process exec: `subprocess` with env overrides and timeouts.
+- Zipping/archiving: `zipfile` or `shutil.make_archive`.
+- Time/IDs: `datetime` (UTC ISO), `time`, `secrets`/`random` for 6-char suffix; run_id format `YYYYMMDDTHHMMSSZ-<6char>`.
 
 
 ## 16) Testing Strategy (maps to Acceptance Tests)
 
-- Unit tests (Jest)
+- Unit tests (pytest/unittest)
   - substitution: namespaces, precedence, undefined handling
   - pointers: `steps.X.lines`, `steps.X.json.path`
   - depends_on: required/optional, globs, loop re-eval, variable substitution
@@ -484,7 +498,7 @@ Contracts (summary):
   - provider argv: template + defaults + overrides, `command_override`
   - CLI safety: clean/archive constraints
 
-- Integration tests
+- Integration tests (pytest)
   - end-to-end sample workflow mirroring spec example
   - inbox atomicity (.tmp → rename), processed/failed moves
   - resume after simulated crash; repair from backup
@@ -556,22 +570,21 @@ Contracts (summary):
 
 ## 21) Appendix — Main Run Loop Sketch
 
-```ts
-async function run(workflowPath: string, opts: CliOptions) {
-  const wf = await loadWorkflow(workflowPath);
-  const run = await createOrLoadRunState(wf, opts);
-  let i = 0;
-  while (i < wf.steps.length) {
-    const step = wf.steps[i];
-    backupState(run, step.name, opts);
-    const outcome = await executeStep(step, run, wf, opts);
-    await writeState(run);
-    const next = nextIndexFromOutcome(outcome, wf, i);
-    if (next === 'END') break;
-    i = next ?? (i + 1);
-  }
-  finalizeRun(run);
-}
+```py
+def run(workflow_path: str, opts: CliOptions) -> None:
+    wf = load_workflow(workflow_path)
+    run_state = create_or_load_run_state(wf, opts)
+    i = 0
+    while i < len(wf.steps):
+        step = wf.steps[i]
+        backup_state(run_state, step.name, opts)
+        outcome = execute_step(step, run_state, wf, opts)
+        write_state(run_state)
+        next_idx = next_index_from_outcome(outcome, wf, i)
+        if next_idx == 'END':
+            break
+        i = next_idx if next_idx is not None else (i + 1)
+    finalize_run(run_state)
 ```
 
 This architecture maps 1:1 with the v1.1 spec and provides enough structure for a junior engineer to start implementing modules in order, with clear interfaces and well-defined behaviors.
