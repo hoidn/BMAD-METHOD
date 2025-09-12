@@ -1,14 +1,8 @@
-# Agent orchestration framework 
+# Workflow programming for LLM agents 
 
 ## Executive Summary
 
-A developer-centric orchestrator for rapidly building, testing, and iterating on AI agent and CLI tool workflows. 
-
-Core Principles:
-- Simplicity & Predictability: Sequential execution with explicit paths
-- Zero Infrastructure: Just Python + YAML + filesystem
-- Observable by Design: Filesystem as message queue, structured status files
-- Safe by Default: No shell interpretation, explicit secrets management
+This specification defines a workflow orchestration system that executes sequences of commands, including LLM model invocations, in a deterministic order. The system uses YAML to define workflows with branching logic. Filesystem directories serve as task queues for inter-agent communication. Each workflow step can invoke shell commands or language model CLIs (Claude Code or Gemini CLI), capture its output in structured formats (text, lines array, or JSON), and have output files (including those created by agent invocation) registered as read dependencies for subsequent steps. The YAML-based orchestration DSL supports string comparison, conditional branching, and loop constructs.
 
 ## Architecture Overview
 
@@ -34,7 +28,7 @@ workspace/
 
 Path Resolution Rule: All user-declared paths remain explicit and resolve against WORKSPACE. No auto-prefixing based on agent.
 
-### Inbox Semantics
+### Task Queue System
 
 Writing Tasks:
 1. Create as `*.tmp` file
@@ -128,7 +122,7 @@ steps:
     input_file: "temp/prompt.md"  # Contains substituted content
 ```
 
-Note: Template processing for file contents is not currently supported. Files are passed literally without variable substitution.
+Template processing for file contents is not currently supported. Files are passed literally without variable substitution.
 
 ### Edge Case Behavior
 
@@ -194,7 +188,7 @@ allow_parse_error: false
 # Provider specification
 provider: "claude"
 provider_params:
-  model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+  model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
 
 # Command override
 command_override: ["claude", "-p", "Custom prompt"]
@@ -219,7 +213,7 @@ Pointer Syntax: The value must be a string in the format `steps.<StepName>.lines
 }
 ```
 
-`lines`: Split on LF, array result
+`lines`: Split into array of lines
 ```json
 {
   "output_capture": "lines",
@@ -268,7 +262,7 @@ steps:
 PROMPT_CONTENT=$(cat prompts/analyze.md)
 
 # Then executes:
-claude -p "$PROMPT_CONTENT" --model claude-3-5-sonnet > artifacts/analysis.md
+claude -p "$PROMPT_CONTENT" --model claude-sonnet-4-20250514 > artifacts/analysis.md
 #      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 #      Prompt text as CLI arg + model selection
 ```
@@ -311,12 +305,6 @@ steps:
     # - artifacts/architect/data_model.md
 ```
 
-### Security Considerations
-
-- Providers have unrestricted filesystem access within the workspace directory
-- Workflow authors must ensure prompts do not request operations outside the workspace
-- Future versions may introduce sandboxing options
-
 ### Best Practices
 
 - Use `output_file` to capture execution logs and agent reasoning for debugging
@@ -330,7 +318,7 @@ steps:
 
 ### Direct CLI Integration
 
-Important: The providers are Claude Code (`claude`), Gemini CLI (`gemini`), and similar tools - NOT raw API calls.
+The providers are Claude Code (`claude`), Gemini CLI (`gemini`), and similar tools - not raw API calls.
 
 Workflow-level templates:
 ```yaml
@@ -338,7 +326,7 @@ providers:
   claude:
     command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
     defaults:
-      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+      model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
   
   gemini:
     command: ["gemini", "-p", "${PROMPT}"]
@@ -356,13 +344,12 @@ steps:
     output_file: "artifacts/architect/analysis.md"
 
   - name: CustomProvider
-    command_override: ["claude", "-p", "Special prompt", "--model", "claude-3-5-haiku"]
+    command_override: ["claude", "-p", "Special prompt", "--model", "claude-opus-4-1-20250805"]
 ```
 
-Note: Claude Code is invoked with `claude -p "prompt" --model <model>`. Available models:
-- `claude-3-5-sonnet` (or `claude-3-5-sonnet-20241022`)
-- `claude-3-5-haiku` (or `claude-3-5-haiku-20241022`) - faster/cheaper
-- `claude-3-opus-latest` - most capable
+Claude Code is invoked with `claude -p "prompt" --model <model>`. Available models:
+- `claude-sonnet-4-20250514` - balanced performance
+- `claude-opus-4-1-20250805` - most capable
 
 Model can also be set via `ANTHROPIC_MODEL` environment variable or `claude config set model`.
 
@@ -417,7 +404,7 @@ providers:
   claude:
     command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
     defaults:
-      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+      model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
 
 steps:
   # Check for pending engineer tasks
@@ -440,10 +427,10 @@ steps:
           agent: "engineer"
           provider: "claude"
           provider_params:
-            model: "claude-3-5-sonnet"
+            model: "claude-sonnet-4-20250514"
           input_file: "${task_file}"  # task_file is already a full path from find
           output_file: "artifacts/engineer/execution_log_${loop.index}.md"  # Captures STDOUT
-          # Note: Claude will create implementation files directly based on prompt instructions
+          # Note: Claude will create implementation files directly
           
         - name: WriteStatus
           command: ["echo", '{"success": true, "task": "${task_file}"}']
@@ -498,7 +485,7 @@ steps:
     #  Write your design to artifacts/architect/system_design.md and api_spec.md"
     
     # Executes as:
-    # claude -p "Create a system architecture..." --model claude-3-5-sonnet > artifacts/architect/log.md
+    # claude -p "Create a system architecture..." --model claude-sonnet-4-20250514 > artifacts/architect/log.md
     
   # Step 2: Compose dynamic task for Agent B (atomic write)
   - name: PrepareEngineerTask

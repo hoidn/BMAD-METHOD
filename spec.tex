@@ -113,7 +113,7 @@
 
 \section{Executive Summary}
 
-This specification defines a workflow orchestration system that executes sequences of commands, including LLM model invocations, in a deterministic order. The system uses YAML (a convenient format for bridging code and data) to define workflows with branching logic. Filesystem directories serve as task queues for inter-agent communication. Each workflow step can invoke shell commands or language model CLIs (Claude Code or Gemini CLI), capture its output in structured formats (text, lines array, or JSON), and have output files (including those created by agent invocation) registered as read dependencies for subsequent steps. The YAML-based orchestration DSL supports string comparison, conditional branching, and loop constracts.
+This specification defines a workflow orchestration system that executes sequences of commands, including LLM model invocations, in a deterministic order. The system uses YAML to define workflows with branching logic. Filesystem directories serve as task queues for inter-agent communication. Each workflow step can invoke shell commands or language model CLIs (Claude Code or Gemini CLI), capture its output in structured formats (text, lines array, or JSON), and have output files (including those created by agent invocation) registered as read dependencies for subsequent steps. The YAML-based orchestration DSL supports string comparison, conditional branching, and loop constracts.
 
 \section{Architecture Overview}
 
@@ -155,7 +155,7 @@ The framework uses filesystem directories as task queues for coordinating work b
     \end{itemize}
 \end{enumerate}
 
-The atomic rename operation ensures that partially-written files are never visible as tasks. Task files contain freeform text, with JSON recommended for structured data exchange.
+The atomic rename prevents partially-written files from being visible as tasks. Task files contain freeform text, with JSON recommended for structured data exchange.
 
 \subsubsection{Configuration}
 
@@ -253,7 +253,7 @@ steps:
     input_file: "temp/prompt.md"  # Contains substituted content
 \end{lstlisting}
 
-\textbf{Note:} Template processing for file contents is not currently supported. Files are passed literally without variable substitution.
+Template processing for file contents is not currently supported. Files are passed literally without variable substitution.
 
 \subsection{Edge Case Behavior}
 
@@ -441,7 +441,7 @@ steps:
 
 \subsection{Direct CLI Integration}
 
-\textbf{Important:} The providers are Claude Code (\texttt{claude}), Gemini CLI (\texttt{gemini}), and similar tools - NOT raw API calls.
+The providers are Claude Code (\texttt{claude}), Gemini CLI (\texttt{gemini}), and similar tools - not raw API calls.
 
 \subsubsection{Workflow-level templates}
 
@@ -472,7 +472,7 @@ steps:
     command_override: ["claude", "-p", "Special prompt", "--model", "claude-opus-4-1-20250805"]
 \end{lstlisting}
 
-\textbf{Note:} Claude Code is invoked with \texttt{claude -p "prompt" --model <model>}. Available models:
+Claude Code is invoked with \texttt{claude -p "prompt" --model <model>}. Available models:
 \begin{itemize}
     \item \texttt{claude-sonnet-4-20250514} - balanced performance
     \item \texttt{claude-opus-4-1-20250805} - most capable
