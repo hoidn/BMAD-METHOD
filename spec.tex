@@ -74,7 +74,7 @@
 % Header and footer
 \pagestyle{fancy}
 \fancyhf{}
-\fancyhead[L]{Agent Orchestration Framework v1.1}
+\fancyhead[L]{Workflow programming for LLM agents}
 \fancyhead[R]{\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
 
@@ -89,23 +89,23 @@
     linkcolor=blue,
     filecolor=magenta,
     urlcolor=cyan,
-    pdftitle={Agent Orchestration Framework v1.1},
+    pdftitle={Workflow programming for LLM agents},
     pdfauthor={},
     bookmarks=true,
     bookmarksopen=true,
     bookmarksnumbered=true
 }
 
-% Document metadata
-\title{\Huge\textbf{Agent Orchestration Framework v1.1}\\[0.5cm]
+%% Document metadata
+\title{\Huge\textbf{Workflow programming for LLM agents}\\[0.5cm]
        \Large Technical Documentation}
 \author{}
-\date{\today}
+%\date{\today}
 
 \begin{document}
 
-\maketitle
-\thispagestyle{empty}
+%\maketitle
+%\thispagestyle{empty}
 
 \newpage
 \tableofcontents
@@ -113,7 +113,7 @@
 
 \section{Executive Summary}
 
-This specification defines a workflow orchestration system that executes sequences of commands, including AI language model invocations, in a deterministic order. The system uses YAML files to define workflows with branching logic, conditionals, and loops based on step outputs. Filesystem directories serve as task queues for inter-process communication, and JSON files provide status reporting. Each workflow step can invoke shell commands or language model CLIs (like Claude or Gemini), capture their output in structured formats (text, lines array, or JSON), and use that output to control subsequent steps through conditional branching or dynamic iteration.
+This specification defines a workflow orchestration system that executes sequences of commands, including LLM model invocations, in a deterministic order. The system uses YAML (a convenient format for bridging code and data) to define workflows with branching logic. Filesystem directories serve as task queues for inter-agent communication. Each workflow step can invoke shell commands or language model CLIs (Claude Code or Gemini CLI), capture its output in structured formats (text, lines array, or JSON), and have output files (including those created by agent invocation) registered as read dependencies for subsequent steps. The YAML-based orchestration DSL supports string comparison, conditional branching, and loop constracts.
 
 \section{Architecture Overview}
 
@@ -313,7 +313,7 @@ allow_parse_error: false
 # Provider specification
 provider: "claude"
 provider_params:
-  model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+  model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
 
 # Command override
 command_override: ["claude", "-p", "Custom prompt"]
@@ -395,7 +395,7 @@ steps:
 PROMPT_CONTENT=$(cat prompts/analyze.md)
 
 # Then executes:
-claude -p "$PROMPT_CONTENT" --model claude-3-5-sonnet > artifacts/analysis.md
+claude -p "$PROMPT_CONTENT" --model claude-sonnet-4-20250514 > artifacts/analysis.md
 #      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 #      Prompt text as CLI arg + model selection
 \end{lstlisting}
@@ -409,13 +409,6 @@ Consider scalability, security, and maintainability.
 Read any files in artifacts/requirements/ for context.
 \end{lstlisting}
 
-\paragraph{Key Benefits}
-\begin{itemize}
-    \item \textbf{No duplication:} Prompt doesn't need to reference itself
-    \item \textbf{Natural prompts:} Write prompts as you normally would
-    \item \textbf{Provider flexibility:} Provider can still read other files mentioned IN the prompt
-    \item \textbf{Clean separation:} \texttt{input\_file} = the prompt, other files = data the prompt references
-\end{itemize}
 
 \subsection{Provider File Operations}
 
@@ -443,14 +436,6 @@ steps:
 \end{lstlisting}
 
 
-\subsection{Best Practices}
-
-\begin{itemize}
-    \item Use \texttt{output\_file} to capture execution logs and agent reasoning for debugging
-    \item Design prompts to write primary outputs as files to appropriate directories
-    \item Use subsequent steps to discover and validate created files
-    \item Document expected file outputs in step comments for clarity
-\end{itemize}
 
 \section{Provider Configuration}
 
@@ -465,7 +450,7 @@ providers:
   claude:
     command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
     defaults:
-      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+      model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
   
   gemini:
     command: ["gemini", "-p", "${PROMPT}"]
@@ -479,19 +464,18 @@ steps:
   - name: Analyze
     provider: "claude"
     provider_params:
-      model: "claude-3-5-sonnet"  # or claude-3-5-haiku for faster/cheaper
+      model: "claude-sonnet-4-20250514"  # or claude-opus-4-1-20250805 for more capability
     input_file: "prompts/analyze.md"
     output_file: "artifacts/architect/analysis.md"
 
   - name: CustomProvider
-    command_override: ["claude", "-p", "Special prompt", "--model", "claude-3-5-haiku"]
+    command_override: ["claude", "-p", "Special prompt", "--model", "claude-opus-4-1-20250805"]
 \end{lstlisting}
 
 \textbf{Note:} Claude Code is invoked with \texttt{claude -p "prompt" --model <model>}. Available models:
 \begin{itemize}
-    \item \texttt{claude-3-5-sonnet} (or \texttt{claude-3-5-sonnet-20241022})
-    \item \texttt{claude-3-5-haiku} (or \texttt{claude-3-5-haiku-20241022}) - faster/cheaper
-    \item \texttt{claude-3-opus-latest} - most capable
+    \item \texttt{claude-sonnet-4-20250514} - balanced performance
+    \item \texttt{claude-opus-4-1-20250805} - most capable
 \end{itemize}
 
 Model can also be set via \texttt{ANTHROPIC\_MODEL} environment variable or \texttt{claude config set model}.
@@ -548,7 +532,7 @@ providers:
   claude:
     command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
     defaults:
-      model: "claude-3-5-sonnet"  # Options: claude-3-5-haiku, claude-3-opus-latest
+      model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
 
 steps:
   # Check for pending engineer tasks
@@ -571,7 +555,7 @@ steps:
           agent: "engineer"
           provider: "claude"
           provider_params:
-            model: "claude-3-5-sonnet"
+            model: "claude-sonnet-4-20250514"
           input_file: "${task_file}"  # task_file is already a full path from find
           output_file: "artifacts/engineer/execution_log_${loop.index}.md"
           # Note: Claude will create implementation files directly
@@ -629,7 +613,7 @@ steps:
     #  Write your design to artifacts/architect/system_design.md and api_spec.md"
     
     # Executes as:
-    # claude -p "Create a system architecture..." --model claude-3-5-sonnet > artifacts/architect/log.md
+    # claude -p "Create a system architecture..." --model claude-sonnet-4-20250514 > artifacts/architect/log.md
     
   # Step 2: Compose dynamic task for Agent B (atomic write)
   - name: PrepareEngineerTask
@@ -647,14 +631,6 @@ steps:
     input_file: "inbox/engineer/task_${run.timestamp_utc}.task"  # Dynamically composed
 \end{lstlisting}
 
-\subsection{Best Practices}
-
-\begin{itemize}
-    \item Keep static templates generic (reference concepts, not specific files)
-    \item Build dynamic prompts at runtime to reference actual artifacts
-    \item Use \texttt{inbox/} for agent work queues to maintain clear task boundaries
-    \item Document the expected flow between agents in workflow comments
-\end{itemize}
 
 \section{Acceptance Tests}
 
