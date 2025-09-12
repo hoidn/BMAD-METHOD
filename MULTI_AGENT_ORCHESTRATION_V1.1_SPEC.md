@@ -1,22 +1,18 @@
-# Multi-Agent Workflow Orchestration Framework - v1.1 Specification
+# Multi-Agent Workflow Orchestration Framework v1.1
 
-**Version:** 1.1  
-**Status:** APPROVED FOR IMPLEMENTATION  
-**Date:** January 2025
-
----
+Version: 1.1  
+Status: APPROVED FOR IMPLEMENTATION  
+Date: January 2025
 
 ## Executive Summary
 
 A developer-centric orchestrator for rapidly building, testing, and iterating on AI agent and CLI tool workflows. Version 1.1 enhances multi-agent coordination through filesystem-backed patterns while maintaining deterministic, sequential execution.
 
-**Core Principles:**
-- **Simplicity & Predictability**: Sequential execution with explicit paths
-- **Zero Infrastructure**: Just Python + YAML + filesystem
-- **Observable by Design**: Filesystem as message queue, structured status files
-- **Safe by Default**: No shell interpretation, explicit secrets management
-
----
+Core Principles:
+- Simplicity & Predictability: Sequential execution with explicit paths
+- Zero Infrastructure: Just Python + YAML + filesystem
+- Observable by Design: Filesystem as message queue, structured status files
+- Safe by Default: No shell interpretation, explicit secrets management
 
 ## Architecture Overview
 
@@ -40,21 +36,21 @@ workspace/
     └── {timestamp}/
 ```
 
-**Path Resolution Rule:** All user-declared paths remain explicit and resolve against WORKSPACE. No auto-prefixing based on agent.
+Path Resolution Rule: All user-declared paths remain explicit and resolve against WORKSPACE. No auto-prefixing based on agent.
 
 ### Inbox Semantics
 
-**Writing Tasks:**
+Writing Tasks:
 1. Create as `*.tmp` file
 2. Atomic rename to `*.task`
 
-**Processing Results:**
-- **Success:** `mv <task> processed/{timestamp}/`
-- **Failure (non-retryable):** `mv <task> failed/{timestamp}/`
+Processing Results:
+- Success: `mv <task> processed/{timestamp}/`
+- Failure (non-retryable): `mv <task> failed/{timestamp}/`
 
-**File Content:** Freeform text; JSON recommended for structured data
+File Content: Freeform text; JSON recommended for structured data
 
-**Configuration:**
+Configuration:
 ```yaml
 # Top-level workflow config (with defaults)
 inbox_dir: "inbox"
@@ -85,46 +81,42 @@ orchestrate run-step <step_name> --workflow workflows/demo.yaml
 orchestrate watch workflows/demo.yaml
 ```
 
-**Safety:** The `--clean-processed` flag will only operate on the `WORKSPACE/processed/` directory and will refuse to run on any other path. The `--archive-processed` destination path must be outside of the `processed/` directory. If a destination is not provided, the archive defaults to `RUN_ROOT/processed.zip`.
-
----
+Safety: The `--clean-processed` flag will only operate on the `WORKSPACE/processed/` directory and will refuse to run on any other path. The `--archive-processed` destination path must be outside of the `processed/` directory. If a destination is not provided, the archive defaults to `RUN_ROOT/processed.zip`.
 
 ## Variable Model
 
 ### Namespaces (precedence order)
-1. **Run Scope**
+
+1. Run Scope
    - `${run.timestamp_utc}` - The start time of the run, formatted as YYYYMMDDTHHMMSSZ
 
-2. **Loop Scope**
+2. Loop Scope
    - `${item}` - Current iteration value
    - `${loop.index}` - Current iteration (0-based)
    - `${loop.total}` - Total iterations
 
-3. **Step Results**
+3. Step Results
    - `${steps.<name>.exit_code}` - Step completion code
    - `${steps.<name>.output}` - Step stdout (text mode)
    - `${steps.<name>.lines}` - Array when `output_capture: lines`
    - `${steps.<name>.json}` - Object when `output_capture: json`
    - `${steps.<name>.duration}` - Execution time
 
-4. **Context Variables**
+4. Context Variables
    - `${context.<key>}` - Workflow-level variables
 
 ### Variable Substitution Scope
 
-#### Where Variables Are Substituted
+Where Variables Are Substituted:
+- Command arrays: `["echo", "${context.message}"]`
+- File paths: `"artifacts/${loop.index}/result.md"`
+- Provider parameters: `model: "${context.model_name}"`
+- Conditional values: `left: "${steps.Previous.output}"`
 
-Variables using the `${...}` syntax are substituted in:
-- **Command arrays**: `["echo", "${context.message}"]`
-- **File paths**: `"artifacts/${loop.index}/result.md"`
-- **Provider parameters**: `model: "${context.model_name}"`
-- **Conditional values**: `left: "${steps.Previous.output}"`
+Where Variables Are NOT Substituted:
+- File contents: The contents of files referenced by `input_file`, `output_file`, or any other file parameters are passed as-is without variable substitution
 
-#### Where Variables Are NOT Substituted
-
-- **File contents**: The contents of files referenced by `input_file`, `output_file`, or any other file parameters are passed as-is without variable substitution
-
-#### Dynamic Content Pattern
+Dynamic Content Pattern:
 
 To include dynamic content in files, use a pre-processing step:
 
@@ -140,27 +132,25 @@ steps:
     input_file: "temp/prompt.md"  # Contains substituted content
 ```
 
-**Future Enhancement:** Version 1.2 may introduce opt-in template processing via a `process_template: true` flag.
+Future Enhancement: Version 1.2 may introduce opt-in template processing via a `process_template: true` flag.
 
 ### Edge Case Behavior
 
 The following behaviors are **implementation-defined** in v1.1 (standardization deferred to v2.0):
 
-#### Undefined Variables
-Implementations may choose to:
-- Substitute with empty string
-- Leave literal `"${undefined.var}"` in place
-- Raise an error and halt execution
+Undefined Variables:
+- Implementations may substitute with empty string
+- Or leave literal `"${undefined.var}"` in place
+- Or raise an error and halt execution
 
-#### Type Coercion in Conditions
-When comparing values in `when` clauses:
+Type Coercion in Conditions:
 - String comparison semantics are implementation-defined
 - Behavior when comparing JSON numbers to string literals is implementation-defined
 
-#### Escape Syntax
-The method to output literal `"${"` in strings is implementation-defined.
+Escape Syntax:
+- The method to output literal `"${"` in strings is implementation-defined
 
-#### Recommendations for Portability
+Recommendations for Portability:
 
 To ensure workflows run consistently across implementations:
 - Always initialize variables before use via `context` or prior steps
@@ -170,7 +160,7 @@ To ensure workflows run consistently across implementations:
 
 ### Environment & Secrets
 
-**Per-step environment injection (not substitution):**
+Per-step environment injection (not substitution):
 ```yaml
 steps:
   - name: Build
@@ -221,11 +211,11 @@ wait_for:
   min_count: 1                          # Min files required (default: 1)
 ```
 
-**Pointer Syntax:** The value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions in v1.1.
+Pointer Syntax: The value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions in v1.1.
 
 ### Output Capture Modes
 
-**`text` (default):** Traditional string capture
+`text` (default): Traditional string capture
 ```json
 {
   "output": "First line\nSecond line\n",
@@ -233,7 +223,7 @@ wait_for:
 }
 ```
 
-**`lines`:** Split on LF, array result
+`lines`: Split on LF, array result
 ```json
 {
   "output_capture": "lines",
@@ -242,7 +232,7 @@ wait_for:
 }
 ```
 
-**`json`:** Parse as JSON object
+`json`: Parse as JSON object
 ```json
 {
   "output_capture": "json",
@@ -253,14 +243,12 @@ wait_for:
 
 Parse failure → exit code 2 unless `allow_parse_error: true`
 
-**Limits:** To ensure stability, the following limits are enforced:
-- **text:** The first 8 KB of stdout is stored in the state file. If the stream exceeds 1 MB, it is spilled to a log file and the `output` field is marked as truncated.
-- **lines:** A maximum of 10,000 lines are stored. If exceeded, the `lines` array will contain the first 10,000 entries and a `truncated: true` flag will be set.
-- **json:** The orchestrator will buffer up to 1 MB of stdout for parsing. If stdout exceeds this limit, parsing fails with exit code 2 (unless `allow_parse_error: true`). Invalid JSON also results in exit code 2.
+Limits:
+- text: The first 8 KB of stdout is stored in the state file. If the stream exceeds 1 MB, it is spilled to a log file and the `output` field is marked as truncated.
+- lines: A maximum of 10,000 lines are stored. If exceeded, the `lines` array will contain the first 10,000 entries and a `truncated: true` flag will be set.
+- json: The orchestrator will buffer up to 1 MB of stdout for parsing. If stdout exceeds this limit, parsing fails with exit code 2 (unless `allow_parse_error: true`). Invalid JSON also results in exit code 2.
 
-**State Fields:** When `output_capture` is set to `lines` or `json`, the raw `output` field is omitted from the step's result in `state.json` to avoid data duplication.
-
----
+State Fields: When `output_capture` is set to `lines` or `json`, the raw `output` field is omitted from the step's result in `state.json` to avoid data duplication.
 
 ## Provider Execution Model
 
@@ -268,11 +256,11 @@ Parse failure → exit code 2 unless `allow_parse_error: true`
 
 When a step specifies both `provider` and `input_file`:
 
-1. **Input Handling**: The orchestrator reads `input_file` contents and passes them as a command-line argument to the provider
-2. **Output Handling**: If `output_file` is specified, STDOUT is redirected to that file
-3. **File contents passed literally**: The prompt text is passed as a CLI argument, not piped via STDIN
+1. Input Handling: The orchestrator reads `input_file` contents and passes them as a command-line argument to the provider
+2. Output Handling: If `output_file` is specified, STDOUT is redirected to that file
+3. File contents passed literally: The prompt text is passed as a CLI argument, not piped via STDIN
 
-**Example Execution:**
+Example Execution:
 ```yaml
 steps:
   - name: Analyze
@@ -289,7 +277,7 @@ claude -p "$PROMPT_CONTENT" --model claude-3-5-sonnet > artifacts/analysis.md
 #      Prompt text as CLI arg + model selection
 ```
 
-**Prompt Contents:**
+Prompt Contents:
 ```markdown
 # prompts/analyze.md
 Analyze the system requirements and create a detailed architecture.
@@ -297,23 +285,23 @@ Consider scalability, security, and maintainability.
 Read any files in artifacts/requirements/ for context.
 ```
 
-**Key Benefits:**
-- **No duplication**: Prompt doesn't need to reference itself
-- **Natural prompts**: Write prompts as you normally would
-- **Provider flexibility**: Provider can still read other files mentioned IN the prompt
-- **Clean separation**: `input_file` = the prompt, other files = data the prompt references
+Key Benefits:
+- No duplication: Prompt doesn't need to reference itself
+- Natural prompts: Write prompts as you normally would
+- Provider flexibility: Provider can still read other files mentioned IN the prompt
+- Clean separation: `input_file` = the prompt, other files = data the prompt references
 
 ### Provider File Operations
 
-#### Concurrent File and Stream Output
+### Concurrent File and Stream Output
 
 Providers can read and write files directly from/to the filesystem while also outputting to STDOUT. These capabilities coexist:
 
-1. **Direct File Operations**: Providers may create, read, or modify files anywhere in the workspace based on prompt instructions
-2. **STDOUT Capture**: The `output_file` parameter captures STDOUT (typically logs, status messages, or reasoning process)
-3. **Simultaneous Operation**: A provider invocation may write multiple files AND produce STDOUT output
+1. Direct File Operations: Providers may create, read, or modify files anywhere in the workspace based on prompt instructions
+2. STDOUT Capture: The `output_file` parameter captures STDOUT (typically logs, status messages, or reasoning process)
+3. Simultaneous Operation: A provider invocation may write multiple files AND produce STDOUT output
 
-**Example:**
+Example:
 ```yaml
 steps:
   - name: GenerateSystem
@@ -327,13 +315,13 @@ steps:
     # - artifacts/architect/data_model.md
 ```
 
-#### Security Considerations
+### Security Considerations
 
 - Providers have unrestricted filesystem access within the workspace directory
 - Workflow authors must ensure prompts do not request operations outside the workspace
 - Future versions may introduce sandboxing options
 
-#### Best Practices
+### Best Practices
 
 - Use `output_file` to capture execution logs and agent reasoning for debugging
 - Design prompts to write primary outputs as files to appropriate directories
@@ -346,9 +334,9 @@ steps:
 
 ### Direct CLI Integration
 
-**Important:** The providers are Claude Code (`claude`), Gemini CLI (`gemini`), and similar tools - NOT raw API calls.
+Important: The providers are Claude Code (`claude`), Gemini CLI (`gemini`), and similar tools - NOT raw API calls.
 
-**Workflow-level templates:**
+Workflow-level templates:
 ```yaml
 providers:
   claude:
@@ -361,7 +349,7 @@ providers:
     # Gemini CLI doesn't support model selection via CLI
 ```
 
-**Step-level usage:**
+Step-level usage:
 ```yaml
 steps:
   - name: Analyze
@@ -375,14 +363,14 @@ steps:
     command_override: ["claude", "-p", "Special prompt", "--model", "claude-3-5-haiku"]
 ```
 
-**Note:** Claude Code is invoked with `claude -p "prompt" --model <model>`. Available models:
+Note: Claude Code is invoked with `claude -p "prompt" --model <model>`. Available models:
 - `claude-3-5-sonnet` (or `claude-3-5-sonnet-20241022`)
 - `claude-3-5-haiku` (or `claude-3-5-haiku-20241022`) - faster/cheaper
 - `claude-3-opus-latest` - most capable
 
 Model can also be set via `ANTHROPIC_MODEL` environment variable or `claude config set model`.
 
-**Exit code mapping (unchanged from v1.0):**
+Exit code mapping (unchanged from v1.0):
 - 0 = Success
 - 1 = Retryable API error
 - 2 = Invalid input (non-retryable)
@@ -421,11 +409,9 @@ Model can also be set via `ANTHROPIC_MODEL` environment variable or `claude conf
 }
 ```
 
-**Default path:** `artifacts/<agent>/status.json` or `status_<step>.json`
+Default path: `artifacts/<agent>/status.json` or `status_<step>.json`
 
-**Path Convention:** All file paths included within a status JSON file (e.g., in the `outputs` array) must be relative to the WORKSPACE directory.
-
----
+Path Convention: All file paths included within a status JSON file (e.g., in the `outputs` array) must be relative to the WORKSPACE directory.
 
 ## Example: Multi-Agent Inbox Processing
 
@@ -568,24 +554,24 @@ steps:
 
 ## v1.1 Acceptance Tests
 
-1. **Lines capture:** `output_capture: lines` → `steps.X.lines[]` populated
-2. **JSON capture:** `output_capture: json` → `steps.X.json` object available
-3. **Dynamic for-each:** `items_from: "steps.List.lines"` iterates correctly
-4. **Status schema:** Write/read status.json with v1 schema
-5. **Inbox atomicity:** `*.tmp` → `rename()` → visible as `*.task`
-6. **Processed/failed:** Success → `processed/{ts}/`, failure → `failed/{ts}/`
-7. **No env namespace:** `${env.*}` rejected by schema validator
-8. **Provider templates:** Template + defaults + params compose argv correctly
-9. **Command override:** Replaces template entirely
-10. **Clean processed:** `--clean-processed` empties directory
-11. **Archive processed:** `--archive-processed` creates zip on success
-12. **Pointer Grammar:** A workflow with `items_from: "steps.X.json.files"` correctly iterates over the nested `files` array
-13. **JSON Oversize:** A step producing >1 MB of JSON correctly fails with exit code 2
-14. **JSON Parse Error Flag:** The same step from above succeeds if `allow_parse_error: true` is set
-15. **CLI Safety:** `orchestrate run --clean-processed` fails if the processed directory is configured outside WORKSPACE
-16. **Wait for files:** `wait_for` step blocks until matching files appear or timeout
-17. **Wait timeout:** `wait_for` with no matching files exits with code 124 after timeout
-18. **Wait state tracking:** `wait_for` records `files`, `wait_duration`, `poll_count` in state.json
+1. Lines capture: `output_capture: lines` → `steps.X.lines[]` populated
+2. JSON capture: `output_capture: json` → `steps.X.json` object available
+3. Dynamic for-each: `items_from: "steps.List.lines"` iterates correctly
+4. Status schema: Write/read status.json with v1 schema
+5. Inbox atomicity: `*.tmp` → `rename()` → visible as `*.task`
+6. Processed/failed: Success → `processed/{ts}/`, failure → `failed/{ts}/`
+7. No env namespace: `${env.*}` rejected by schema validator
+8. Provider templates: Template + defaults + params compose argv correctly
+9. Command override: Replaces template entirely
+10. Clean processed: `--clean-processed` empties directory
+11. Archive processed: `--archive-processed` creates zip on success
+12. Pointer Grammar: A workflow with `items_from: "steps.X.json.files"` correctly iterates over the nested `files` array
+13. JSON Oversize: A step producing >1 MB of JSON correctly fails with exit code 2
+14. JSON Parse Error Flag: The same step from above succeeds if `allow_parse_error: true` is set
+15. CLI Safety: `orchestrate run --clean-processed` fails if the processed directory is configured outside WORKSPACE
+16. Wait for files: `wait_for` step blocks until matching files appear or timeout
+17. Wait timeout: `wait_for` with no matching files exits with code 124 after timeout
+18. Wait state tracking: `wait_for` records `files`, `wait_duration`, `poll_count` in state.json
 
 ---
 
@@ -605,32 +591,32 @@ steps:
 
 ## Implementation Order
 
-1. **Schema Updates** (Day 1)
+1. Schema Updates (Day 1)
    - Remove env namespace validation
    - Add output_capture, items_from, agent fields
    - Add provider configuration schema
 
-2. **Core Engine** (Day 2-3)
+2. Core Engine (Day 2-3)
    - Output capture modes implementation
    - Dynamic for-each from arrays
    - Status file writing/reading
 
-3. **Provider Integration** (Day 4)
+3. Provider Integration (Day 4)
    - Template system
    - Direct CLI execution
    - Command override support
 
-4. **Inbox Pattern** (Day 5)
+4. Inbox Pattern (Day 5)
    - Atomic write helpers
    - Move to processed/failed
    - Directory initialization
 
-5. **CLI Operations** (Day 6)
+5. CLI Operations (Day 6)
    - --clean-processed flag
    - --archive-processed flag
    - Directory structure validation
 
-6. **Testing & Documentation** (Day 7)
+6. Testing & Documentation (Day 7)
    - Acceptance test suite
    - Migration guide
    - Example workflows
@@ -647,4 +633,4 @@ steps:
 
 ---
 
-**END OF SPECIFICATION v1.1**
+END OF SPECIFICATION v1.1
