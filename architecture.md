@@ -20,11 +20,6 @@ Modern LLM-based agent systems require a robust mechanism to execute sequences o
 
 **Decision:** The filesystem is the primary medium for state, artifacts, and inter-agent communication. We will use a structured directory layout (`inbox/`, `artifacts/`, `processed/`, etc.) instead of a database, message queue, or in-memory data store.
 
-Path Resolution Rule:
-- All workflow-declared paths resolve against WORKSPACE (the orchestrator CWD).
-- Absolute paths and any path containing `..` are rejected.
-- Symlinks are followed, but if resolution would escape WORKSPACE, the path is rejected.
-
 **Rationale:**
 *   **Transparency:** Any developer can inspect the state of the system using standard tools (`ls`, `cat`, `find`). This drastically simplifies debugging.
 *   **Simplicity:** It removes the need for additional infrastructure (databases, brokers), making the system lightweight and easy to set up.
@@ -554,9 +549,7 @@ This flow illustrates how two agents, "Architect" and "Engineer," coordinate.
 *   **Observability:** All significant actions must be logged. Logs must automatically mask any values identified as secrets. The `state.json` file serves as a structured audit log.
 *   **Security:**
     *   **Secret Management:** Secrets are passed via environment variables and must never be logged or persisted in the state file.
-    *   **Filesystem Safety:**
-        - Operations like `--clean-processed` must contain safeguards to prevent execution on paths outside `WORKSPACE/processed`.
-        - Enforce Path Resolution Rules (reject absolute paths and `..`; follow symlinks but prevent escaping WORKSPACE).
+    *   **Filesystem Safety:** Operations like `--clean-processed` must contain safeguards to prevent execution on paths outside the designated `workspace`.
 
 ## 6. Future Considerations (Out of Scope)
 

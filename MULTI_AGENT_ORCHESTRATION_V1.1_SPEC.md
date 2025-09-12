@@ -28,6 +28,11 @@ workspace/
 
 Path Resolution Rule: All user-declared paths remain explicit and resolve against WORKSPACE. No auto-prefixing based on agent.
 
+Path Safety (MVP default):
+- Reject absolute paths and any path that contains `..` during validation.
+- Follow symlinks, but if the resolved real path escapes WORKSPACE, reject the path.
+- Enforce these checks at load time and before filesystem operations.
+
 ### Run Identity and State Management
 
 #### Run Identification
@@ -77,6 +82,10 @@ The state file (`${RUN_ROOT}/state.json`) is the authoritative record of executi
 }
 ```
 
+Step Status Semantics:
+- Step `status` values: `pending | running | completed | failed | skipped`.
+- Conditional steps with `when` that evaluate false are marked `skipped` and do not execute a process (treat as `exit_code: 0`).
+
 #### State Integrity
 
 **Corruption Detection:**
@@ -99,10 +108,10 @@ orchestrate resume <run_id> --repair  # Best-effort recovery
 orchestrate clean --older-than 7d  # Remove old run directories
 ```
 
-**State Backup:**
-- Before each step execution: `cp state.json state.json.step_${step_name}.bak`
-- Keep last 3 backups per run (rotating)
-- On corruption, attempt rollback to last valid backup
+**State Backup (MVP policy):**
+- When `--backup-state` is enabled (or in `--debug`), before each step execution copy `state.json` to `state.json.step_${step_name}.bak`.
+- Keep last 3 backups per run (rotating).
+- On corruption, attempt rollback to last valid backup.
 
 ### Task Queue System
 
@@ -141,10 +150,10 @@ orchestrate run workflows/demo.yaml \
 orchestrate resume <run_id>
 
 # Execute single step
-orchestrate run-step <step_name> --workflow workflows/demo.yaml
+orchestrate run-step <step_name> --workflow workflows/demo.yaml   # Optional (post-MVP)
 
 # Watch for changes and re-run
-orchestrate watch workflows/demo.yaml
+orchestrate watch workflows/demo.yaml                             # Optional (post-MVP)
 ```
 
 Safety: The `--clean-processed` flag will only operate on the `WORKSPACE/processed/` directory and will refuse to run on any other path. The `--archive-processed` destination path must be outside of the `processed/` directory. If a destination is not provided, the archive defaults to `RUN_ROOT/processed.zip`.
@@ -167,14 +176,14 @@ Safety: The `--clean-processed` flag will only operate on the `WORKSPACE/process
 --state-dir <path>     # Override default .orchestrate/runs
 
 # Error handling
---on-error stop|continue|interactive  # Error behavior
+--on-error stop|continue|interactive  # Error behavior (interactive optional/post-MVP)
 --max-retries <n>      # Retry failed steps (default: 0)
 --retry-delay <ms>     # Delay between retries
 
 # Output control  
 --quiet                # Minimal output
 --verbose              # Detailed output
---json                 # JSON output for tooling
+--json                 # JSON output for tooling (optional/post-MVP)
 --log-level debug|info|warn|error
 ```
 
@@ -240,29 +249,21 @@ steps:
 
 Template processing for file contents is not currently supported. Files are passed literally without variable substitution.
 
-### Edge Case Behavior
+### MVP Defaults and Edge Cases
 
-The following behaviors are **implementation-defined**:
+Undefined Variables (MVP default):
+- Referencing an undefined variable is an error; the step halts with exit code 2 and records error context. A future flag may allow treating undefined as empty string.
 
-Undefined Variables:
-- Implementations may substitute with empty string
-- Or leave literal `"${undefined.var}"` in place
-- Or raise an error and halt execution
+Type Coercion in Conditions (MVP default):
+- Conditions compare as strings; JSON numbers and booleans are coerced to strings prior to comparison.
 
-Type Coercion in Conditions:
-- String comparison semantics are implementation-defined
-- Behavior when comparing JSON numbers to string literals is implementation-defined
+Escape Syntax (MVP default):
+- Use `$$` to render a literal `$`. To render the sequence `${`, write `$${`.
 
-Escape Syntax:
-- The method to output literal `"${"` in strings is implementation-defined
-
-Recommendations for Portability:
-
-To ensure workflows run consistently across implementations:
-- Always initialize variables before use via `context` or prior steps
-- Use explicit string values in conditions: `"true"` rather than boolean `true`
-- Avoid literal `"${"` in strings
-- Document implementation requirements if using edge cases
+Portability Recommendations:
+- Initialize variables before use via `context` or prior steps.
+- Prefer explicit strings in conditions: `"true"` rather than boolean `true`.
+- Avoid literal `${` in strings unless escaped as `$${`.
 
 ### Environment & Secrets
 
@@ -315,6 +316,7 @@ wait_for:
   timeout_sec: 1800                      # Max wait time (default: 300)
   poll_ms: 500                          # Poll interval (default: 500)
   min_count: 1                          # Min files required (default: 1)
+  # Note: wait_for is mutually exclusive with command/provider/for_each in the same step.
 
 # Dependency validation and injection
 depends_on:
@@ -370,7 +372,22 @@ Limits:
 
 State Fields: When `output_capture` is set to `lines` or `json`, the raw `output` field is omitted from the step's result in `state.json` to avoid data duplication.
 
+### Control Flow Defaults (MVP)
+- `strict_flow: true` means any non-zero exit halts the run unless an `on.failure.goto` is defined for that step.
+- `_end` is a reserved `goto` target that terminates the run successfully.
+
 ## Provider Execution Model
+
+### Command Construction and ${PROMPT}
+
+Command precedence:
+1. If `command_override` is set, it fully replaces the provider template.
+2. Else, use the provider template with merged parameters (`defaults` overridden by `provider_params`).
+3. Else, use the raw `command` array when no `provider` is specified.
+
+Reserved placeholder `${PROMPT}`:
+- Provider templates may include `${PROMPT}` to receive the composed input text as a single argv token.
+- `${PROMPT}` is built from `input_file` contents after optional dependency injection. Injection is performed in-memory; input files are never modified on disk.
 
 ### Input/Output Contract
 
@@ -410,6 +427,9 @@ Key Benefits:
 - Natural prompts: Write prompts as you normally would
 - Provider flexibility: Provider can still read other files mentioned IN the prompt
 - Clean separation: `input_file` = the prompt, other files = data the prompt references
+
+Output capture with `output_file`:
+- When `output_file` is set, STDOUT is redirected to that file. The orchestrator still captures output per `output_capture` rules into state (subject to truncation/spill rules) for observability.
 
 ### Provider File Operations
 
@@ -468,7 +488,7 @@ steps:
 
 1. **Validation Time**: Immediately before step execution (after previous steps complete)
 2. **Variable Substitution**: `${...}` variables ARE substituted using current context
-3. **Pattern Syntax**: POSIX glob patterns (`*` and `?` wildcards)
+3. **Pattern Syntax**: POSIX glob patterns (`*` and `?` wildcards); globstar `**` is not supported in v1.1
 4. **Pattern Matching**: 
    - `required` + 0 matches = exit code 2 (non-retryable failure)
    - `optional` + 0 matches = no warning (intentional)
@@ -1096,18 +1116,21 @@ steps:
         position: "append"
     # Template comes first, data is appended as reference
     
-  # Pattern expansion with injection
+  # Pattern expansion with injection (non-recursive)
   - name: ReviewAllCode
     provider: "claude"
     input_file: "prompts/code_review.md"
     depends_on:
       required:
-        - "src/**/*.py"  # Could match many files
-        - "tests/**/*.py"
+        - "src/*.py"      # POSIX glob; non-recursive
+        - "tests/*.py"
       inject:
         mode: "list"
         instruction: "Review all these Python files for quality and consistency:"
     # All matched files are listed with clear instruction
+    # Note: For recursive discovery, first generate a file list via a step like
+    #   command: ["bash", "-c", "find src tests -name '*.py' -type f"] with output_capture: lines,
+    # then pass that list through a for_each loop or render into a prompt file.
     
   # No injection (classic mode)
   - name: ManualCoordination
@@ -1198,6 +1221,10 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 30. **Pattern Injection:** Glob patterns resolve to full file list before injection
 31. **Optional File Injection:** Missing optional files omitted from injection without error
 32. **No Injection Default:** Without `inject` field, no modification to prompt occurs
+33. **Wait-For Exclusivity:** A step that combines `wait_for` with `command`/`provider`/`for_each` is rejected by validation
+34. **Conditional Skip:** When `when.equals` evaluates false, step `status` is `skipped` with `exit_code: 0`
+35. **Path Safety (Absolute):** Absolute paths are rejected at validation time
+36. **Path Safety (Parent Escape):** Paths containing `..` or symlinks resolving outside WORKSPACE are rejected
 
 ---
 
@@ -1208,4 +1235,3 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 - Parallel execution blocks
 - Complex expression evaluation
 - Event-driven triggers
-
