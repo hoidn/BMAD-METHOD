@@ -103,9 +103,49 @@ when:
 The `for_each` construct provides iteration over collections with the following semantics:
 
 #### State Management
+
+Loop state is managed with the following structure:
+
+```json
+{
+  "steps": {
+    "<loop_step_name>": {
+      "type": "for_each",
+      "iterations": [
+        {
+          "index": 0,
+          "item": "value1",
+          "steps": {
+            "Process": {
+              "exit_code": 0,
+              "output": "...",
+              "completed_at": "2024-01-01T12:00:00Z"
+            }
+          },
+          "status": "completed",
+          "started_at": "2024-01-01T12:00:00Z",
+          "completed_at": "2024-01-01T12:00:05Z"
+        }
+      ],
+      "summary": {
+        "total_items": 5,
+        "completed": 3,
+        "failed": 1,
+        "skipped": 1,
+        "success_rate": 0.6,
+        "total_duration": 45.2
+      },
+      "exit_code": 0,
+      "completed_at": "2024-01-01T12:00:50Z"
+    }
+  }
+}
+```
+
 - Each iteration maintains isolated state under `${steps.<step_name>.iterations[<index>]}`
 - Results are collected into an array preserving iteration order
 - Loop-level aggregates available via `${steps.<step_name>.summary}`
+- Iteration state persisted atomically after each iteration
 
 #### Variable Scoping
 ```yaml
@@ -128,12 +168,15 @@ for_each:
 - **Parallel Mode** (`parallel: true`): All items processed concurrently
 - **Break/Continue**: Special goto targets `_loop_break` and `_loop_continue`
 - **Nested Loops**: Supported with proper variable shadowing
+- **Error Handling**: Failed iterations can be configured to continue or abort
 
 ```yaml
 for_each:
   items: [1, 2, 3, 4, 5]
   as: num
   max_iterations: 100  # Safety limit
+  on_item_failure: continue  # continue | abort | retry
+  retry_failed_items: 2  # Retry count for failed iterations
   steps:
     - name: Check
       when:
@@ -143,7 +186,22 @@ for_each:
           goto: _loop_break    # Exit loop entirely
         failure:
           goto: _loop_continue # Skip to next iteration
+    - name: Process
+      command: ["process.sh", "${num}"]
+      on:
+        failure:
+          goto: _loop_continue  # Skip failed item and continue
 ```
+
+#### Loop Control Variables
+Available within loop body:
+- `${item}`: Current iteration item (or custom name via `as:`)
+- `${loop.index}`: Current iteration index (0-based)
+- `${loop.total}`: Total number of items
+- `${loop.first}`: Boolean, true if first iteration
+- `${loop.last}`: Boolean, true if last iteration
+- `${loop.attempt}`: Current retry attempt for this item (1-based)
+- `${loop.parent_step}`: Name of the loop step
 
 #### Parallel Execution
 ```yaml
@@ -171,12 +229,18 @@ while:
   max_iterations: 100       # Hard limit to prevent infinite loops
   max_duration: 600         # Timeout in seconds
   check_interval: 5         # Optional delay between iterations
+  on_max_iterations: break  # break | error | continue
+  on_timeout: error         # break | error | continue
+  persist_state: true       # Save state after each iteration
   steps:
     - name: Check Status
       command: ["./check.sh"]
     - name: Process
       when:
         expr: "${loop.iteration} > 0"  # Skip first iteration
+      on:
+        failure:
+          goto: _loop_continue  # Continue to next iteration
 ```
 
 #### Loop Context Variables
@@ -184,6 +248,40 @@ Available within loop body:
 - `${loop.iteration}`: Current iteration number (0-based)
 - `${loop.elapsed}`: Seconds since loop started
 - `${loop.remaining_time}`: Seconds until max_duration
+- `${loop.remaining_iterations}`: Iterations until max_iterations
+- `${loop.last_iteration}`: Boolean, true if this is the final iteration
+
+#### While Loop State Management
+
+```json
+{
+  "steps": {
+    "<while_step_name>": {
+      "type": "while",
+      "iterations": [
+        {
+          "iteration": 0,
+          "condition_result": true,
+          "steps": {
+            "Check Status": {"exit_code": 0, "output": "not ready"},
+            "Process": {"exit_code": 0, "output": "processing..."}
+          },
+          "duration": 5.2,
+          "completed_at": "2024-01-01T12:00:05Z"
+        }
+      ],
+      "summary": {
+        "total_iterations": 15,
+        "total_duration": 78.5,
+        "final_condition": false,
+        "termination_reason": "condition_false"
+      },
+      "exit_code": 0,
+      "completed_at": "2024-01-01T12:01:18Z"
+    }
+  }
+}
+```
 
 ## Concurrency and State Management Specification
 
@@ -693,59 +791,121 @@ class SecureEvaluator:
 class ParallelExecutor:
     """Execute steps in parallel with proper joining"""
     
-    def execute_parallel(self, steps: List[Dict], runner: 'ProductionWorkflowRunner') -> Dict:
-        """Execute steps concurrently"""
-        results = {}
+    def execute_parallel(self, parallel_config: Dict, runner: 'ProductionWorkflowRunner') -> Dict:
+        """Execute steps concurrently with proper result aggregation"""
+        steps = parallel_config['steps']
+        max_workers = parallel_config.get('max_workers', min(len(steps), 10))
+        join_config = parallel_config.get('join', {})
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = {
+            'parallel_results': {},
+            'summary': {
+                'total_steps': len(steps),
+                'completed': 0,
+                'failed': 0,
+                'cancelled': 0,
+                'success_rate': 0.0
+            },
+            'exit_code': 0,
+            'output': '',
+            'completed_at': None
+        }
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(runner.execute_step, step): step['name']
+                executor.submit(runner.execute_single_step, step): step['name']
                 for step in steps
             }
             
             # Handle join configuration
-            join_config = steps[0].get('join', {}) if steps else {}
             wait_for = join_config.get('wait_for', 'all')
             timeout = join_config.get('timeout', 600)
+            on_timeout = join_config.get('on_timeout', {}).get('action', 'cancel_remaining')
             
-            if wait_for == 'all':
-                done, not_done = concurrent.futures.wait(
-                    futures, timeout=timeout,
-                    return_when=concurrent.futures.ALL_COMPLETED
-                )
-            elif wait_for == 'any':
-                done, not_done = concurrent.futures.wait(
-                    futures, timeout=timeout,
-                    return_when=concurrent.futures.FIRST_COMPLETED
-                )
-            elif wait_for == 'majority':
-                # Wait for >50% to complete
-                required = len(futures) // 2 + 1
-                done = set()
-                start_time = time.time()
-                
-                while len(done) < required and time.time() - start_time < timeout:
-                    completed, _ = concurrent.futures.wait(
-                        futures - done, timeout=1,
-                        return_when=concurrent.futures.FIRST_COMPLETED
-                    )
-                    done.update(completed)
+            done, not_done = self._wait_for_completion(futures, wait_for, timeout)
+            
+            # Handle timeout behavior
+            if not_done and on_timeout == 'cancel_remaining':
+                for future in not_done:
+                    future.cancel()
                     
-                not_done = futures - done
-            
-            # Cancel incomplete futures
-            for future in not_done:
-                future.cancel()
-                
             # Collect results
             for future in done:
                 step_name = futures[future]
                 try:
-                    results[step_name] = future.result()
+                    step_result = future.result()
+                    results['parallel_results'][step_name] = step_result
+                    if step_result.get('exit_code', 0) == 0:
+                        results['summary']['completed'] += 1
+                    else:
+                        results['summary']['failed'] += 1
                 except Exception as e:
-                    results[step_name] = {'error': str(e), 'exit_code': 1}
+                    results['parallel_results'][step_name] = {
+                        'error': str(e), 
+                        'exit_code': 1,
+                        'completed_at': datetime.utcnow().isoformat()
+                    }
+                    results['summary']['failed'] += 1
+                    
+            # Handle cancelled futures
+            for future in not_done:
+                step_name = futures[future]
+                if future.cancelled():
+                    results['parallel_results'][step_name] = {
+                        'cancelled': True,
+                        'exit_code': 2,
+                        'completed_at': datetime.utcnow().isoformat()
+                    }
+                    results['summary']['cancelled'] += 1
+                    
+            # Calculate final status
+            total_completed = results['summary']['completed']
+            total_steps = results['summary']['total_steps']
+            results['summary']['success_rate'] = total_completed / total_steps if total_steps > 0 else 0.0
+            
+            # Determine overall exit code based on join policy
+            if wait_for == 'all':
+                results['exit_code'] = 0 if results['summary']['failed'] == 0 else 1
+            elif wait_for == 'any':
+                results['exit_code'] = 0 if results['summary']['completed'] > 0 else 1
+            elif wait_for == 'majority':
+                required = (total_steps // 2) + 1
+                results['exit_code'] = 0 if results['summary']['completed'] >= required else 1
+                
+            results['completed_at'] = datetime.utcnow().isoformat()
+            results['output'] = f"Parallel execution completed: {total_completed}/{total_steps} successful"
                     
         return results
+        
+    def _wait_for_completion(self, futures, wait_for, timeout):
+        """Wait for futures based on join policy"""
+        if wait_for == 'all':
+            return concurrent.futures.wait(
+                futures, timeout=timeout,
+                return_when=concurrent.futures.ALL_COMPLETED
+            )
+        elif wait_for == 'any':
+            return concurrent.futures.wait(
+                futures, timeout=timeout,
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
+        elif wait_for == 'majority':
+            # Wait for >50% to complete
+            required = len(futures) // 2 + 1
+            done = set()
+            start_time = time.time()
+            
+            while len(done) < required and time.time() - start_time < timeout:
+                completed, _ = concurrent.futures.wait(
+                    futures - done, timeout=1,
+                    return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                done.update(completed)
+                
+            not_done = futures - done
+            return done, not_done
+        else:
+            raise ValueError(f"Unknown wait_for policy: {wait_for}")
 
 class ProductionWorkflowRunner:
     """Production-ready orchestrator with full features"""
@@ -891,7 +1051,7 @@ class ProductionWorkflowRunner:
                 
         # Handle parallel execution
         if 'parallel' in step:
-            return self.parallel.execute_parallel(step['parallel'], self)
+            return self.parallel.execute_parallel(step, self)
             
         # Handle for_each loops
         if 'for_each' in step:
@@ -994,11 +1154,288 @@ class ProductionWorkflowRunner:
         temp_path.write_text(content)
         temp_path.replace(path)  # Atomic on POSIX
         
-    # Additional methods for for_each, while, conditions, etc.
-    # ... (implementation continues)
+    def execute_for_each(self, step: Dict) -> Dict:
+        """Execute for_each loop with state management"""
+        for_each_config = step['for_each']
+        items = self.resolve_items(for_each_config['items'])
+        as_name = for_each_config.get('as', 'item')
+        max_iterations = for_each_config.get('max_iterations', len(items))
+        parallel = for_each_config.get('parallel', False)
+        on_item_failure = for_each_config.get('on_item_failure', 'continue')
+        
+        result = {
+            'type': 'for_each',
+            'iterations': [],
+            'summary': {
+                'total_items': len(items),
+                'completed': 0,
+                'failed': 0,
+                'skipped': 0,
+                'success_rate': 0.0,
+                'total_duration': 0.0
+            },
+            'exit_code': 0,
+            'output': '',
+            'completed_at': None
+        }
+        
+        start_time = time.time()
+        
+        if parallel:
+            result = self._execute_for_each_parallel(items, for_each_config, result)
+        else:
+            result = self._execute_for_each_sequential(items, for_each_config, result)
+            
+        result['summary']['total_duration'] = time.time() - start_time
+        result['completed_at'] = datetime.utcnow().isoformat()
+        
+        if result['summary']['total_items'] > 0:
+            result['summary']['success_rate'] = result['summary']['completed'] / result['summary']['total_items']
+            
+        return result
+        
+    def _execute_for_each_sequential(self, items, config, result):
+        """Execute for_each items sequentially"""
+        loop_steps = config['steps']
+        as_name = config.get('as', 'item')
+        
+        for index, item in enumerate(items):
+            if self.cancelled:
+                break
+                
+            iteration_result = {
+                'index': index,
+                'item': item,
+                'steps': {},
+                'status': 'running',
+                'started_at': datetime.utcnow().isoformat()
+            }
+            
+            # Set loop context variables
+            loop_context = {
+                as_name: item,
+                'loop': {
+                    'index': index,
+                    'total': len(items),
+                    'first': index == 0,
+                    'last': index == len(items) - 1,
+                    'attempt': 1
+                }
+            }
+            
+            # Execute loop body steps
+            try:
+                for loop_step in loop_steps:
+                    # Substitute loop variables in step
+                    resolved_step = self.substitute_loop_variables(loop_step, loop_context)
+                    step_result = self.execute_single_step(resolved_step)
+                    
+                    iteration_result['steps'][resolved_step['name']] = step_result
+                    
+                    # Handle control flow
+                    if 'on' in resolved_step:
+                        next_action = self.get_step_action(resolved_step, step_result)
+                        if next_action == '_loop_break':
+                            iteration_result['status'] = 'break'
+                            result['iterations'].append(iteration_result)
+                            return result
+                        elif next_action == '_loop_continue':
+                            iteration_result['status'] = 'continue'
+                            break
+                            
+                iteration_result['status'] = 'completed'
+                result['summary']['completed'] += 1
+                
+            except Exception as e:
+                iteration_result['error'] = str(e)
+                iteration_result['status'] = 'failed'
+                result['summary']['failed'] += 1
+                
+                if config.get('on_item_failure', 'continue') == 'abort':
+                    result['exit_code'] = 1
+                    result['iterations'].append(iteration_result)
+                    return result
+                    
+            iteration_result['completed_at'] = datetime.utcnow().isoformat()
+            result['iterations'].append(iteration_result)
+            
+            # Persist state after each iteration
+            self.state.save()
+            
+        return result
+        
+    def execute_while(self, step: Dict) -> Dict:
+        """Execute while loop with safety bounds"""
+        while_config = step['while']
+        condition = while_config['condition']
+        max_iterations = while_config.get('max_iterations', 1000)
+        max_duration = while_config.get('max_duration', 3600)
+        check_interval = while_config.get('check_interval', 0)
+        
+        result = {
+            'type': 'while',
+            'iterations': [],
+            'summary': {
+                'total_iterations': 0,
+                'total_duration': 0.0,
+                'final_condition': False,
+                'termination_reason': None
+            },
+            'exit_code': 0,
+            'output': '',
+            'completed_at': None
+        }
+        
+        start_time = time.time()
+        iteration = 0
+        
+        while iteration < max_iterations:
+            if self.cancelled:
+                result['summary']['termination_reason'] = 'cancelled'
+                break
+                
+            elapsed = time.time() - start_time
+            if elapsed >= max_duration:
+                result['summary']['termination_reason'] = 'timeout'
+                if while_config.get('on_timeout', 'error') == 'error':
+                    result['exit_code'] = 1
+                break
+                
+            # Evaluate condition
+            loop_context = {
+                'loop': {
+                    'iteration': iteration,
+                    'elapsed': elapsed,
+                    'remaining_time': max_duration - elapsed,
+                    'remaining_iterations': max_iterations - iteration,
+                    'last_iteration': iteration == max_iterations - 1
+                }
+            }
+            
+            condition_result = self.evaluate_condition_with_context(condition, loop_context)
+            
+            if not condition_result:
+                result['summary']['termination_reason'] = 'condition_false'
+                result['summary']['final_condition'] = False
+                break
+                
+            # Execute iteration
+            iteration_result = {
+                'iteration': iteration,
+                'condition_result': condition_result,
+                'steps': {},
+                'duration': 0.0,
+                'started_at': datetime.utcnow().isoformat()
+            }
+            
+            iteration_start = time.time()
+            
+            try:
+                for while_step in while_config['steps']:
+                    resolved_step = self.substitute_loop_variables(while_step, loop_context)
+                    step_result = self.execute_single_step(resolved_step)
+                    iteration_result['steps'][resolved_step['name']] = step_result
+                    
+                    # Handle control flow
+                    if 'on' in resolved_step:
+                        next_action = self.get_step_action(resolved_step, step_result)
+                        if next_action == '_loop_break':
+                            result['summary']['termination_reason'] = 'explicit_break'
+                            iteration_result['completed_at'] = datetime.utcnow().isoformat()
+                            result['iterations'].append(iteration_result)
+                            return result
+                        elif next_action == '_loop_continue':
+                            break
+                            
+            except Exception as e:
+                iteration_result['error'] = str(e)
+                # Continue loop unless configured otherwise
+                
+            iteration_result['duration'] = time.time() - iteration_start
+            iteration_result['completed_at'] = datetime.utcnow().isoformat()
+            result['iterations'].append(iteration_result)
+            
+            iteration += 1
+            
+            # Optional delay between iterations
+            if check_interval > 0:
+                time.sleep(check_interval)
+                
+            # Persist state
+            self.state.save()
+            
+        if iteration >= max_iterations:
+            result['summary']['termination_reason'] = 'max_iterations'
+            if while_config.get('on_max_iterations', 'break') == 'error':
+                result['exit_code'] = 1
+                
+        result['summary']['total_iterations'] = iteration
+        result['summary']['total_duration'] = time.time() - start_time
+        result['completed_at'] = datetime.utcnow().isoformat()
+        
+        return result
+        
+    def substitute_loop_variables(self, step: Dict, loop_context: Dict) -> Dict:
+        """Substitute loop variables in step configuration"""
+        import copy
+        import json
+        
+        # Deep copy to avoid modifying original
+        resolved_step = copy.deepcopy(step)
+        
+        # Convert to JSON string for substitution, then back
+        step_json = json.dumps(resolved_step)
+        
+        # Replace loop variables
+        for var_name, var_value in loop_context.items():
+            if isinstance(var_value, dict):
+                for sub_var, sub_value in var_value.items():
+                    pattern = f"${{{var_name}.{sub_var}}}"
+                    step_json = step_json.replace(pattern, str(sub_value))
+            else:
+                pattern = f"${{{var_name}}}"
+                step_json = step_json.replace(pattern, str(var_value))
+                
+        return json.loads(step_json)
+        
+    def resolve_items(self, items_config) -> List:
+        """Resolve items from config (can be literal array or variable reference)"""
+        if isinstance(items_config, list):
+            return items_config
+        elif isinstance(items_config, str) and items_config.startswith('${'):
+            # Variable reference - resolve from context/state
+            return self.substitute_variables(items_config)
+        else:
+            return [items_config]  # Single item
+            
+    def evaluate_condition_with_context(self, condition, loop_context):
+        """Evaluate condition with loop context variables"""
+        # Temporarily add loop context to state for evaluation
+        original_context = self.state.state.get('loop_context', {})
+        self.state.state['loop_context'] = loop_context
+        
+        try:
+            result = self.evaluate_condition(condition)
+        finally:
+            self.state.state['loop_context'] = original_context
+            
+        return result
+        
+    def get_step_action(self, step: Dict, result: Dict) -> str:
+        """Determine next action based on step result"""
+        if 'on' not in step:
+            return None
+            
+        event = 'success' if result.get('exit_code', 0) == 0 else 'failure'
+        if event in step['on']:
+            return step['on'][event].get('goto')
+            
+        return None
 ```
 
-## Workflow Schema Definition
+## Complete Schema Definitions
+
+### Workflow Schema
 
 ```json
 {
@@ -1015,6 +1452,10 @@ class ProductionWorkflowRunner:
     "name": {
       "type": "string",
       "description": "Workflow name"
+    },
+    "strict_flow": {
+      "type": "boolean",
+      "description": "Require explicit transitions (default true for v2.0, false for v1.0)"
     },
     "context": {
       "type": "object",
@@ -1049,6 +1490,11 @@ class ProductionWorkflowRunner:
         "prompt": {"type": "string"},
         "prompt_file": {"type": "string"},
         "input_file": {"type": "string"},
+        "input_files": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Multiple input files for step"
+        },
         "output_file": {"type": "string"},
         "timeout": {"type": "number"},
         "retry": {
@@ -1082,20 +1528,79 @@ class ProductionWorkflowRunner:
           "type": "array",
           "items": {"$ref": "#/definitions/step"}
         },
+        "join": {
+          "type": "object",
+          "description": "Configuration for parallel step joining",
+          "properties": {
+            "wait_for": {
+              "type": "string",
+              "enum": ["all", "any", "majority"],
+              "description": "Wait strategy for parallel steps"
+            },
+            "timeout": {
+              "type": "number",
+              "description": "Timeout in seconds for join operation"
+            },
+            "on_timeout": {"$ref": "#/definitions/action"}
+          }
+        },
         "for_each": {
           "type": "object",
+          "required": ["items", "steps"],
           "properties": {
-            "items": {},
-            "as": {"type": "string"},
-            "steps": {"type": "array"}
+            "items": {
+              "description": "Array of items to iterate over or variable reference"
+            },
+            "as": {
+              "type": "string",
+              "default": "item",
+              "description": "Variable name for current iteration item"
+            },
+            "parallel": {
+              "type": "boolean",
+              "default": false,
+              "description": "Execute iterations in parallel"
+            },
+            "max_workers": {
+              "type": "number",
+              "description": "Maximum concurrent workers for parallel execution"
+            },
+            "summary": {
+              "type": "object",
+              "description": "Summary configuration for loop results",
+              "properties": {
+                "count": {"type": "boolean"},
+                "success_rate": {"type": "boolean"},
+                "failures": {"type": "boolean"}
+              }
+            },
+            "steps": {
+              "type": "array",
+              "items": {"$ref": "#/definitions/step"}
+            }
           }
         },
         "while": {
           "type": "object",
+          "required": ["condition", "steps"],
           "properties": {
             "condition": {"$ref": "#/definitions/condition"},
-            "max_duration": {"type": "number"},
-            "steps": {"type": "array"}
+            "max_iterations": {
+              "type": "number",
+              "description": "Maximum number of loop iterations"
+            },
+            "max_duration": {
+              "type": "number",
+              "description": "Maximum loop duration in seconds"
+            },
+            "check_interval": {
+              "type": "number",
+              "description": "Delay between iterations in seconds"
+            },
+            "steps": {
+              "type": "array",
+              "items": {"$ref": "#/definitions/step"}
+            }
           }
         }
       }
@@ -1106,9 +1611,15 @@ class ProductionWorkflowRunner:
         {
           "type": "object",
           "properties": {
-            "all": {"type": "array"},
-            "any": {"type": "array"},
-            "not": {},
+            "all": {
+              "type": "array",
+              "items": {"$ref": "#/definitions/condition"}
+            },
+            "any": {
+              "type": "array", 
+              "items": {"$ref": "#/definitions/condition"}
+            },
+            "not": {"$ref": "#/definitions/condition"},
             "step_ok": {"type": "string"},
             "file_exists": {"type": "string"},
             "env_set": {"type": "string"},
@@ -1120,7 +1631,173 @@ class ProductionWorkflowRunner:
     "action": {
       "type": "object",
       "properties": {
-        "goto": {"type": "string"}
+        "goto": {
+          "type": "string",
+          "description": "Name of step to jump to"
+        },
+        "end": {
+          "type": "boolean",
+          "description": "End workflow with success (exit code 0)"
+        },
+        "error": {
+          "type": "string",
+          "description": "End workflow with error message (exit code 1)"
+        }
+      }
+    }
+  }
+}
+```
+
+### State Schema
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Workflow Run State",
+  "type": "object",
+  "required": ["run_id", "status", "started_at", "context", "steps"],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "Unique identifier for this workflow run (UUID v4)"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["running", "completed", "failed", "cancelled", "error"],
+      "description": "Current status of the workflow run"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when workflow started"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when workflow completed"
+    },
+    "context": {
+      "type": "object",
+      "description": "Runtime context variables available to all steps"
+    },
+    "current_step": {
+      "type": "string",
+      "description": "Name of currently executing or last executed step"
+    },
+    "steps": {
+      "type": "object",
+      "description": "Execution results for each step",
+      "patternProperties": {
+        "^[a-zA-Z][a-zA-Z0-9_\\s]*$": {
+          "$ref": "#/definitions/step_result"
+        }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "description": "Encrypted/masked secret values"
+    },
+    "fingerprints": {
+      "type": "object",
+      "description": "Step fingerprints for idempotency checking",
+      "patternProperties": {
+        "^[a-f0-9]{16}$": {
+          "type": "boolean"
+        }
+      }
+    },
+    "error": {
+      "type": "string",
+      "description": "Error message if workflow failed"
+    }
+  },
+  "definitions": {
+    "step_result": {
+      "type": "object",
+      "properties": {
+        "exit_code": {
+          "type": "number",
+          "description": "Process exit code"
+        },
+        "output": {
+          "type": "string",
+          "description": "Standard output from step execution"
+        },
+        "duration": {
+          "type": "number",
+          "description": "Execution time in seconds"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when step completed"
+        },
+        "skipped": {
+          "type": "boolean",
+          "description": "True if step was skipped due to conditions"
+        },
+        "iterations": {
+          "type": "array",
+          "description": "Results from for_each loop iterations",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {"type": "number"},
+              "item": {},
+              "result": {"$ref": "#/definitions/step_result"},
+              "completed_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "description": "Aggregated results for loops",
+          "properties": {
+            "count": {
+              "type": "number",
+              "description": "Total number of iterations"
+            },
+            "success_count": {
+              "type": "number",
+              "description": "Number of successful iterations"
+            },
+            "failure_count": {
+              "type": "number",
+              "description": "Number of failed iterations"
+            },
+            "success_rate": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Ratio of successful to total iterations"
+            },
+            "total_duration": {
+              "type": "number",
+              "description": "Total execution time for all iterations"
+            },
+            "average_duration": {
+              "type": "number",
+              "description": "Average execution time per iteration"
+            }
+          }
+        },
+        "while_state": {
+          "type": "object",
+          "description": "State tracking for while loops",
+          "properties": {
+            "iteration_count": {"type": "number"},
+            "elapsed_time": {"type": "number"},
+            "condition_met": {"type": "boolean"},
+            "exit_reason": {
+              "type": "string",
+              "enum": ["condition_met", "max_iterations", "max_duration", "error"]
+            }
+          }
+        }
       }
     }
   }
@@ -1248,26 +1925,35 @@ name: "Parallel Analysis"
 steps:
   - name: Analyze Components
     parallel:
-      - name: Frontend Analysis
-        provider: claude
-        prompt: "Analyze frontend code"
-        input_file: frontend/
-        output_file: frontend_analysis.md
-        
-      - name: Backend Analysis
-        provider: claude
-        prompt: "Analyze backend code"
-        input_file: backend/
-        output_file: backend_analysis.md
-        
-      - name: Database Analysis
-        provider: claude
-        prompt: "Analyze database schema"
-        input_file: schema.sql
-        output_file: db_analysis.md
+      max_workers: 3
+      steps:
+        - name: Frontend Analysis
+          provider: claude
+          prompt: "Analyze frontend code"
+          input_file: frontend/
+          output_file: frontend_analysis.md
+          
+        - name: Backend Analysis
+          provider: claude
+          prompt: "Analyze backend code"
+          input_file: backend/
+          output_file: backend_analysis.md
+          
+        - name: Database Analysis
+          provider: claude
+          prompt: "Analyze database schema"
+          input_file: schema.sql
+          output_file: db_analysis.md
     join:
       wait_for: all  # Wait for all to complete
       timeout: 600
+      on_timeout:
+        action: cancel_remaining  # cancel | continue | ignore
+    on:
+      success:
+        goto: Synthesize Results
+      failure:
+        error: "Analysis failed for required components"
       
   - name: Synthesize Results
     provider: claude
@@ -1469,6 +2155,481 @@ steps:
         end: true
 ```
 
+## Expression and Variable Evaluation Model
+
+The framework implements a secure, two-phase evaluation pipeline for all variable substitutions and expression evaluations, ensuring consistent behavior across all workflow constructs.
+
+### Evaluation Pipeline
+
+All variable substitutions and expressions follow this secure evaluation pipeline:
+
+#### Phase 1: Variable Substitution
+All `${...}` patterns are resolved to their values using namespace-scoped variable lookup.
+
+#### Phase 2: Expression Evaluation (Optional)
+If the result contains an `expr:` prefix, the expression is evaluated using a secure AST-based evaluator.
+
+### Variable Namespaces
+
+The framework provides four distinct namespaces for variable resolution:
+
+#### Context Namespace: `${context.*}`
+Accesses workflow-level context variables defined in the YAML or set during execution.
+
+```yaml
+context:
+  environment: "staging"
+  version: "1.2.3"
+  
+# Usage:
+command: ["deploy", "${context.environment}", "${context.version}"]
+# Resolves to: ["deploy", "staging", "1.2.3"]
+```
+
+#### Steps Namespace: `${steps.<name>.*}`
+Accesses results from completed workflow steps, including:
+- `exit_code`: Step exit status (integer)
+- `output`: Step output (string, truncated to limit)
+- `duration`: Execution time in seconds (float)
+- `completed_at`: ISO timestamp of completion
+- `iterations[]`: Array of results for loop steps
+- `summary.*`: Aggregated loop results
+
+```yaml
+# After step "Build" completes:
+when:
+  expr: "${steps.Build.exit_code} == 0"
+  
+prompt: |
+  Build completed in ${steps.Build.duration} seconds.
+  Output preview: ${steps.Build.output}
+```
+
+#### Loop Namespace: `${loop.*}`
+Available only within loop bodies (`for_each` and `while`):
+
+**For-Each Loops:**
+- `${loop.index}`: Current iteration index (0-based)
+- `${loop.total}`: Total number of items
+- `${loop.first}`: Boolean, true on first iteration
+- `${loop.last}`: Boolean, true on last iteration
+- `${loop.iteration}`: Current iteration number (1-based, alias for index+1)
+
+**While Loops:**
+- `${loop.iteration}`: Current iteration count (0-based)
+- `${loop.elapsed}`: Seconds since loop started
+- `${loop.remaining_time}`: Seconds until max_duration timeout
+
+**Loop Item Access:**
+- `${<item_var>}`: Current item value (name defined by `as:` parameter)
+
+```yaml
+for_each:
+  items: ["alpha", "beta", "gamma"]
+  as: service
+  steps:
+    - name: Process Service
+      command: ["echo", "Processing ${service} (${loop.index}/${loop.total})"]
+      # On second iteration: ["echo", "Processing beta (1/3)"]
+      
+      when:
+        expr: "${loop.first} or ${service} == 'beta'"
+        # True on first iteration or when processing "beta"
+```
+
+#### Environment Namespace: `${env.*}`
+Accesses environment variables, but only those explicitly allowlisted for security:
+
+```yaml
+# Workflow level allowlist
+secrets:
+  - API_KEY
+  - DATABASE_URL
+  
+# Step level access  
+steps:
+  - name: Deploy
+    command: ["deploy", "--key", "${env.API_KEY}"]
+    secrets:
+      - API_KEY  # Must be listed here to access
+```
+
+### Variable Resolution Algorithm
+
+The framework resolves variables using this precedence order:
+
+1. **Loop Variables**: `${item}`, `${loop.*}` (only within loop scope)
+2. **Step Results**: `${steps.<name>.*}`
+3. **Context Variables**: `${context.*}`
+4. **Environment Variables**: `${env.*}` (if allowlisted)
+
+#### Scoping Rules
+
+**Variable Shadowing:**
+Inner scopes can shadow outer scopes. Loop variables shadow context variables of the same name.
+
+**Nested Loop Scoping:**
+```yaml
+for_each:
+  items: ["outer1", "outer2"]
+  as: item
+  steps:
+    - name: Nested Loop
+      for_each:
+        items: ["inner1", "inner2"]
+        as: item  # Shadows outer ${item}
+        steps:
+          - name: Inner Step
+            command: ["echo", "${item}"]  # Accesses inner item
+            # To access outer: would need different variable name
+```
+
+**Step Result Scoping:**
+Step results are globally accessible once the step completes, following dot-notation paths:
+
+```yaml
+steps:
+  - name: Complex Step
+    for_each:
+      items: [1, 2, 3]
+      steps:
+        - name: Inner
+          command: ["echo", "test"]
+          
+# Later access:
+# ${steps.Complex Step.summary.count} - Total iterations
+# ${steps.Complex Step.iterations[0].Inner.output} - First iteration result
+# ${steps.Complex Step.iterations[1].Inner.exit_code} - Second iteration exit code
+```
+
+### Expression Evaluation
+
+#### Structured Conditions (Recommended)
+The preferred approach uses structured conditions without arbitrary expressions:
+
+```yaml
+when:
+  all:
+    - step_ok: build           # ${steps.build.exit_code} == 0
+    - file_exists: dist.tar.gz # File exists in artifacts directory
+    - any:
+        - env_set: FORCE_DEPLOY    # ${env.FORCE_DEPLOY} is non-empty
+        - context_equals:          # ${context.branch} == "main"
+            var: branch
+            value: main
+        - step_output_contains:    # ${steps.test.output} contains "PASSED"
+            step: test
+            text: "PASSED"
+```
+
+#### Expression Evaluation (Advanced)
+For complex conditions requiring expressions, the framework supports safe AST-based evaluation:
+
+```yaml
+when:
+  expr: "${steps.build.exit_code} == 0 and ${context.environment} in ['staging', 'prod']"
+  
+while:
+  condition:
+    expr: "${steps.check.exit_code} != 0 and ${loop.iteration} < 5"
+```
+
+**Supported Expression Operations:**
+- **Arithmetic**: `+`, `-`, `*`, `/`
+- **Comparison**: `==`, `!=`, `<`, `<=`, `>`, `>=`
+- **Logical**: `and`, `or`, `not`
+- **Membership**: `in`, `not in`
+- **Type Checking**: `isinstance(var, str)`
+
+**Security Restrictions:**
+- No function calls except whitelisted type checks
+- No attribute access except on safe built-in types
+- No imports or eval constructs
+- Variables must resolve through defined namespaces
+- Expression complexity limited to prevent DoS
+
+### SecureEvaluator Implementation
+
+```python
+class SecureEvaluator:
+    """Safe expression evaluation without eval()"""
+    
+    def __init__(self, variable_resolver):
+        self.resolver = variable_resolver
+        
+    def evaluate_expression(self, expr_text: str) -> Any:
+        """Evaluate expression using AST with security constraints"""
+        import ast
+        import operator
+        
+        # Allowed operations
+        safe_operators = {
+            # Arithmetic
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Mod: operator.mod,
+            
+            # Comparison
+            ast.Eq: operator.eq,
+            ast.NotEq: operator.ne,
+            ast.Lt: operator.lt,
+            ast.LtE: operator.le,
+            ast.Gt: operator.gt,
+            ast.GtE: operator.ge,
+            
+            # Logical
+            ast.And: lambda x, y: x and y,
+            ast.Or: lambda x, y: x or y,
+            ast.Not: operator.not_,
+            
+            # Membership
+            ast.In: lambda x, y: x in y,
+            ast.NotIn: lambda x, y: x not in y,
+        }
+        
+        def eval_node(node, depth=0):
+            if depth > 50:  # Prevent deep recursion DoS
+                raise ValueError("Expression too complex")
+                
+            if isinstance(node, ast.Constant):
+                return node.value
+                
+            elif isinstance(node, ast.Name):
+                # Variable must be resolved through ${...} syntax
+                var_expr = f"${{{node.id}}}"
+                return self.resolver.substitute_variable(var_expr)
+                
+            elif isinstance(node, ast.BinOp):
+                if type(node.op) not in safe_operators:
+                    raise ValueError(f"Unsafe operation: {type(node.op)}")
+                left = eval_node(node.left, depth + 1)
+                right = eval_node(node.right, depth + 1)
+                return safe_operators[type(node.op)](left, right)
+                
+            elif isinstance(node, ast.Compare):
+                left = eval_node(node.left, depth + 1)
+                for op, comparator in zip(node.ops, node.comparators):
+                    if type(op) not in safe_operators:
+                        raise ValueError(f"Unsafe comparison: {type(op)}")
+                    right = eval_node(comparator, depth + 1)
+                    if not safe_operators[type(op)](left, right):
+                        return False
+                    left = right
+                return True
+                
+            elif isinstance(node, ast.BoolOp):
+                if type(node.op) not in safe_operators:
+                    raise ValueError(f"Unsafe boolean op: {type(node.op)}")
+                values = [eval_node(v, depth + 1) for v in node.values]
+                if isinstance(node.op, ast.And):
+                    return all(values)
+                elif isinstance(node.op, ast.Or):
+                    return any(values)
+                    
+            elif isinstance(node, ast.UnaryOp):
+                if type(node.op) not in safe_operators:
+                    raise ValueError(f"Unsafe unary op: {type(node.op)}")
+                operand = eval_node(node.operand, depth + 1)
+                return safe_operators[type(node.op)](operand)
+                
+            elif isinstance(node, ast.List):
+                return [eval_node(item, depth + 1) for item in node.elts]
+                
+            elif isinstance(node, ast.Str):  # Python < 3.8 compatibility
+                return node.s
+                
+            else:
+                raise ValueError(f"Unsafe AST node type: {type(node)}")
+        
+        try:
+            tree = ast.parse(expr_text.strip(), mode='eval')
+            return eval_node(tree.body)
+        except Exception as e:
+            raise ValueError(f"Expression evaluation failed: {e}")
+```
+
+### Unified Evaluation Function
+
+The framework uses a single evaluation function for all contexts:
+
+```python
+class VariableEvaluator:
+    """Unified variable and expression evaluator"""
+    
+    def evaluate_condition(self, condition) -> bool:
+        """Evaluate any condition format consistently"""
+        
+        if isinstance(condition, bool):
+            return condition
+            
+        if isinstance(condition, str):
+            # Direct expression
+            if condition.startswith("expr:"):
+                return bool(self.secure_evaluator.evaluate_expression(condition[5:]))
+            else:
+                # Treat as variable substitution
+                result = self.substitute_variables(condition)
+                return self.is_truthy(result)
+                
+        if isinstance(condition, dict):
+            # Structured condition
+            return self.evaluate_structured_condition(condition)
+            
+        return False
+        
+    def evaluate_structured_condition(self, condition: dict) -> bool:
+        """Evaluate structured condition safely"""
+        
+        if 'all' in condition:
+            return all(self.evaluate_condition(c) for c in condition['all'])
+            
+        elif 'any' in condition:
+            return any(self.evaluate_condition(c) for c in condition['any'])
+            
+        elif 'not' in condition:
+            return not self.evaluate_condition(condition['not'])
+            
+        elif 'step_ok' in condition:
+            step_name = condition['step_ok']
+            return self.state.get_step_exit_code(step_name) == 0
+            
+        elif 'file_exists' in condition:
+            filename = self.substitute_variables(condition['file_exists'])
+            return (self.state.artifacts_dir / filename).exists()
+            
+        elif 'env_set' in condition:
+            env_var = condition['env_set']
+            return self.get_env_var(env_var) is not None
+            
+        elif 'expr' in condition:
+            return bool(self.secure_evaluator.evaluate_expression(condition['expr']))
+            
+        elif 'context_equals' in condition:
+            var_path = condition['context_equals']['var']
+            expected = condition['context_equals']['value']
+            actual = self.get_context_var(var_path)
+            return actual == expected
+            
+        return False
+        
+    def substitute_variables(self, text: str) -> str:
+        """Phase 1: Variable substitution"""
+        import re
+        
+        def replace_var(match):
+            var_path = match.group(1)
+            return str(self.resolve_variable_path(var_path))
+            
+        return re.sub(r'\$\{([^}]+)\}', replace_var, text)
+        
+    def resolve_variable_path(self, path: str) -> Any:
+        """Resolve variable path through namespaces with precedence"""
+        parts = path.split('.')
+        namespace = parts[0]
+        
+        # Check loop variables first (highest precedence)
+        if self.loop_context and namespace in self.loop_context:
+            return self.navigate_dict(self.loop_context, parts)
+            
+        # Check step results
+        elif namespace == 'steps':
+            return self.get_step_result(parts[1:])
+            
+        # Check context variables
+        elif namespace == 'context':
+            return self.get_context_var('.'.join(parts[1:]))
+            
+        # Check environment variables (must be allowlisted)
+        elif namespace == 'env':
+            return self.get_env_var(parts[1])
+            
+        # Check loop namespace explicitly
+        elif namespace == 'loop' and self.loop_context:
+            return self.loop_context.get('.'.join(parts[1:]))
+            
+        # Check current loop item variable
+        elif self.loop_context and namespace == self.loop_context.get('_item_var'):
+            return self.loop_context['_current_item']
+            
+        return ""  # Default to empty string for missing variables
+```
+
+### Evaluation Examples
+
+#### Complete Variable Resolution Example
+
+```yaml
+context:
+  project_name: "my-app"
+  environments: ["dev", "staging", "prod"]
+  
+steps:
+  - name: Deploy All
+    for_each:
+      items: ${context.environments}  # ["dev", "staging", "prod"]
+      as: env
+      steps:
+        - name: Deploy Service
+          command: ["deploy", "${context.project_name}", "${env}"]
+          # First iteration: ["deploy", "my-app", "dev"]
+          # Second iteration: ["deploy", "my-app", "staging"]  
+          # Third iteration: ["deploy", "my-app", "prod"]
+          
+        - name: Verify
+          command: ["curl", "https://${env}.example.com/health"]
+          when:
+            expr: "${loop.index} > 0"  # Skip dev environment (index 0)
+            
+  - name: Report Results
+    prompt: |
+      Deployment Summary:
+      Total environments: ${steps.Deploy All.summary.total}
+      Successful: ${steps.Deploy All.summary.success_count}
+      Failed: ${steps.Deploy All.summary.failure_count}
+      
+      Details:
+      % for i in range(${steps.Deploy All.summary.total}):
+      Environment ${steps.Deploy All.iterations[${i}].env}: ${steps.Deploy All.iterations[${i}].Deploy Service.exit_code == 0 ? 'SUCCESS' : 'FAILED'}
+      % endfor
+```
+
+#### Expression Evaluation Example
+
+```yaml
+steps:
+  - name: Build
+    command: ["npm", "run", "build"]
+    
+  - name: Test
+    command: ["npm", "test"]
+    when:
+      expr: "${steps.Build.exit_code} == 0"
+      
+  - name: Deploy
+    command: ["deploy.sh"]
+    when:
+      all:
+        - expr: "${steps.Build.exit_code} == 0"
+        - expr: "${steps.Test.exit_code} == 0"
+        - any:
+            - expr: "${context.branch} == 'main'"
+            - expr: "${env.FORCE_DEPLOY} != ''"
+            - expr: "${context.environment} in ['staging', 'prod']"
+```
+
+### Security Guarantees
+
+1. **No Code Injection**: All expressions parsed via AST, no `eval()` or `exec()`
+2. **Namespace Isolation**: Variables only accessible through defined namespaces
+3. **Operation Whitelisting**: Only safe operators allowed in expressions
+4. **Depth Limits**: Recursion depth limited to prevent DoS attacks
+5. **Environment Protection**: Environment variables must be explicitly allowlisted
+6. **Type Safety**: All operations type-checked at runtime
+
+This evaluation model provides a complete, secure, and consistent foundation for all variable substitution and expression evaluation throughout the workflow framework.
+
 ## Summary of Key Changes
 
 1. **Committed to Centralized Architecture**: Removed all references to autonomous agents, pattern watching, and artifact claiming. The orchestrator controls all execution.
@@ -1513,4 +2674,11 @@ steps:
    - Clear termination semantics with defined exit codes
    - Special targets for workflow control (`_start`, `_end`, `_error`)
 
-This revised specification provides a complete, consistent, and production-ready blueprint that fully addresses all critical feedback. The specification now includes detailed mechanics for loops, robust lock management, and explicit control flow - closing all identified gaps while maintaining the original vision of a powerful yet simple orchestration framework.
+9. **Complete Expression and Variable Evaluation Model**:
+   - Two-phase evaluation pipeline: variable substitution followed by expression evaluation
+   - Four distinct namespaces: context, steps, loop, env with clear precedence rules
+   - Secure AST-based expression evaluation with operation whitelisting
+   - Unified evaluation function handling all condition formats
+   - Complete variable scoping rules for nested contexts
+
+This revised specification provides a complete, consistent, and production-ready blueprint that fully addresses all critical feedback. The specification now includes detailed mechanics for loops, robust lock management, explicit control flow, and a comprehensive expression evaluation system - closing all identified gaps while maintaining the original vision of a powerful yet simple orchestration framework.

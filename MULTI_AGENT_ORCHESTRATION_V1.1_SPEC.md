@@ -79,11 +79,13 @@ orchestrate run workflows/demo.yaml \
 orchestrate resume <run_id>
 
 # Execute single step (v1.0 behavior preserved)
-orchestrate run-step <step_name>
+orchestrate run-step <step_name> --workflow workflows/demo.yaml
 
 # Watch for changes and re-run (v1.0 behavior preserved)
 orchestrate watch workflows/demo.yaml
 ```
+
+**Safety:** The `--clean-processed` flag will only operate on the `WORKSPACE/processed/` directory and will refuse to run on any other path. The `--archive-processed` destination path must be outside of the `processed/` directory. If a destination is not provided, the archive defaults to `RUN_ROOT/processed.zip`.
 
 ---
 
@@ -93,19 +95,22 @@ orchestrate watch workflows/demo.yaml
 - ~~`${env.*}`~~ - **REMOVED** for security and simplicity
 
 ### Retained Namespaces (precedence order)
-1. **Loop Scope**
+1. **Run Scope**
+   - `${run.timestamp_utc}` - The start time of the run, formatted as YYYYMMDDTHHMMSSZ
+
+2. **Loop Scope**
    - `${item}` - Current iteration value
    - `${loop.index}` - Current iteration (0-based)
    - `${loop.total}` - Total iterations
 
-2. **Step Results**
+3. **Step Results**
    - `${steps.<name>.exit_code}` - Step completion code
    - `${steps.<name>.output}` - Step stdout (text mode)
    - `${steps.<name>.lines}` - Array when `output_capture: lines`
    - `${steps.<name>.json}` - Object when `output_capture: json`
    - `${steps.<name>.duration}` - Execution time
 
-3. **Context Variables**
+4. **Context Variables**
    - `${context.<key>}` - Workflow-level variables
 
 ### Environment & Secrets
@@ -129,7 +134,7 @@ steps:
 
 ```yaml
 # Agent label (optional, for documentation)
-agent: "engineer"
+agent: "engineer"  # The agent field is an informational label for documentation and observability; it does not affect path resolution or any other execution behavior.
 
 # Output capture mode
 output_capture: "text"  # Default: text | lines | json
@@ -142,6 +147,9 @@ for_each:
   as: item
   steps: [...]
 
+# Optional, only applies when output_capture: json
+allow_parse_error: false
+
 # Provider parameters (NEW)
 provider: "claude"
 provider_params:
@@ -150,7 +158,16 @@ provider_params:
 
 # Command override (NEW)
 command_override: ["claude", "-p", "Custom prompt"]
+
+# Wait for files (NEW) - blocking primitive for inter-agent communication
+wait_for:
+  glob: "inbox/engineer/replies/*.task"  # File pattern to watch
+  timeout_sec: 1800                      # Max wait time (default: 300)
+  poll_ms: 500                          # Poll interval (default: 500)
+  min_count: 1                          # Min files required (default: 1)
 ```
+
+**Pointer Syntax:** The value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions in v1.1.
 
 ### Output Capture Modes
 
@@ -181,6 +198,13 @@ command_override: ["claude", "-p", "Custom prompt"]
 ```
 
 Parse failure → exit code 2 unless `allow_parse_error: true`
+
+**Limits:** To ensure stability, the following limits are enforced:
+- **text:** The first 8 KB of stdout is stored in the state file. If the stream exceeds 1 MB, it is spilled to a log file and the `output` field is marked as truncated.
+- **lines:** A maximum of 10,000 lines are stored. If exceeded, the `lines` array will contain the first 10,000 entries and a `truncated: true` flag will be set.
+- **json:** The orchestrator will buffer up to 1 MB of stdout for parsing. If stdout exceeds this limit, parsing fails with exit code 2 (unless `allow_parse_error: true`). Invalid JSON also results in exit code 2.
+
+**State Fields:** When `output_capture` is set to `lines` or `json`, the raw `output` field is omitted from the step's result in `state.json` to avoid data duplication.
 
 ---
 
@@ -259,20 +283,23 @@ steps:
 
 **Default path:** `artifacts/<agent>/status.json` or `status_<step>.json`
 
+**Path Convention:** All file paths included within a status JSON file (e.g., in the `outputs` array) must be relative to the WORKSPACE directory.
+
 ---
 
 ## Example: Multi-Agent Inbox Processing
 
 ```yaml
-version: "1.0"
+version: "1.1"
 name: "multi_agent_feature_dev"
 strict_flow: true
 
 providers:
   claude:
-    command: ["claude", "-p"]
+    command: ["claude", "--model", "${model}", "--max-tokens", "${max_tokens}"]
     defaults:
       model: "claude-3-5-sonnet"
+      max_tokens: 4096
 
 steps:
   # Check for pending engineer tasks
@@ -307,7 +334,7 @@ steps:
           output_capture: "json"
           
         - name: MoveToProcessed
-          command: ["mv", "${task_file}", "processed/${loop.index}/"]
+          command: ["mv", "${task_file}", "processed/${run.timestamp_utc}_${loop.index}/"]
           
         - name: CreateQATask
           when:
@@ -337,6 +364,7 @@ steps:
 - Provider templates and `command_override`
 - Status JSON files
 - Inbox/processed/failed directories
+- `wait_for:` blocking file wait primitive
 
 ### Migration Steps
 1. Replace `${env.VAR}` with `${context.VAR}` or add to step `env:`
@@ -358,6 +386,13 @@ steps:
 9. **Command override:** Replaces template entirely
 10. **Clean processed:** `--clean-processed` empties directory
 11. **Archive processed:** `--archive-processed` creates zip on success
+12. **Pointer Grammar:** A workflow with `items_from: "steps.X.json.files"` correctly iterates over the nested `files` array
+13. **JSON Oversize:** A step producing >1 MB of JSON correctly fails with exit code 2
+14. **JSON Parse Error Flag:** The same step from above succeeds if `allow_parse_error: true` is set
+15. **CLI Safety:** `orchestrate run --clean-processed` fails if the processed directory is configured outside WORKSPACE
+16. **Wait for files:** `wait_for` step blocks until matching files appear or timeout
+17. **Wait timeout:** `wait_for` with no matching files exits with code 124 after timeout
+18. **Wait state tracking:** `wait_for` records `files`, `wait_duration`, `poll_count` in state.json
 
 ---
 
