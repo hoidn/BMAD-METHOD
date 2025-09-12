@@ -102,6 +102,7 @@ Where Variables Are Substituted:
 - File paths: `"artifacts/${loop.index}/result.md"`
 - Provider parameters: `model: "${context.model_name}"`
 - Conditional values: `left: "${steps.Previous.output}"`
+- Dependency paths: `depends_on.required: ["data/${context.dataset}/*.csv"]`
 
 Where Variables Are NOT Substituted:
 - File contents: The contents of files referenced by `input_file`, `output_file`, or any other file parameters are passed as-is without variable substitution
@@ -199,6 +200,20 @@ wait_for:
   timeout_sec: 1800                      # Max wait time (default: 300)
   poll_ms: 500                          # Poll interval (default: 500)
   min_count: 1                          # Min files required (default: 1)
+
+# Dependency validation and injection
+depends_on:
+  required:   # Files that must exist
+    - "config/*.yaml"
+    - "data/${context.dataset}/*.csv"
+  optional:   # Files that may exist
+    - "cache/previous.json"
+  inject: true  # Auto-inject file list
+  # OR advanced form:
+  inject:
+    mode: "list"  # How to inject: list | content | none
+    instruction: "Custom instruction for these files:"
+    position: "prepend"  # Where to inject: prepend | append
 ```
 
 Pointer Syntax: The value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions.
@@ -312,6 +327,166 @@ steps:
 - Use subsequent steps to discover and validate created files
 - Document expected file outputs in step comments for clarity
 
+### File Dependencies
+
+#### Optional Dependency Declaration
+
+Steps may declare file dependencies for pre-execution validation and documentation:
+
+**Syntax:**
+```yaml
+steps:
+  - name: ProcessData
+    provider: "claude"
+    input_file: "prompts/process.md"
+    depends_on:
+      required:  # Must exist or step fails
+        - "config.json"
+        - "data/*.csv"
+        - "artifacts/architect/*.md"
+      optional:  # Warning if missing, continues execution
+        - "cache/previous.json"
+        - "docs/reference.md"
+```
+
+#### Behavior Rules
+
+1. **Validation Time**: Immediately before step execution (after previous steps complete)
+2. **Variable Substitution**: `${...}` variables ARE substituted using current context
+3. **Pattern Syntax**: POSIX glob patterns (`*` and `?` wildcards)
+4. **Pattern Matching**: 
+   - `required` + 0 matches = exit code 2 (non-retryable failure)
+   - `optional` + 0 matches = no warning (intentional)
+5. **Existence Check**: File OR directory present = exists
+6. **Path Resolution**: Relative to WORKSPACE
+7. **Symlinks**: Followed
+8. **Loop Context**: Re-evaluated each iteration with current loop variables
+
+#### Error Handling
+
+- Missing required dependency produces exit code 2 (non-retryable)
+- Standard `on.failure` handlers apply
+- Error message includes the missing path/pattern
+
+#### Benefits
+
+- **Fail Fast**: Detect missing files before expensive provider calls
+- **Documentation**: Explicit declaration of file relationships  
+- **Better Errors**: Clear messages about what's missing
+- **Future-Ready**: Enables caching and change detection in v2
+
+#### Dependency Injection
+
+The orchestrator can automatically inject dependency information into the provider's input, eliminating the need to manually maintain file lists in prompts.
+
+##### Basic Injection
+
+```yaml
+depends_on:
+  required:
+    - "artifacts/architect/*.md"
+  inject: true  # Enable auto-injection with defaults
+```
+
+When `inject: true`, the orchestrator prepends:
+```
+The following files are required inputs for this task:
+- artifacts/architect/system_design.md
+- artifacts/architect/api_spec.md
+
+[original prompt content]
+```
+
+##### Advanced Injection
+
+```yaml
+depends_on:
+  required:
+    - "artifacts/architect/*.md"
+  optional:
+    - "docs/standards.md"
+  inject:
+    mode: "list"  # list | content | none (default: none)
+    instruction: "Review these architecture files:"  # Custom instruction
+    position: "prepend"  # prepend | append (default: prepend)
+```
+
+##### Injection Modes
+
+**`list` mode**: Injects file paths with instruction
+```
+Review these architecture files:
+Required:
+- artifacts/architect/system_design.md
+- artifacts/architect/api_spec.md
+Optional (if available):
+- docs/standards.md
+
+[original prompt content]
+```
+
+**`content` mode**: Injects full file contents
+```
+Review these architecture files:
+
+=== File: artifacts/architect/system_design.md ===
+[full content of file]
+
+=== File: artifacts/architect/api_spec.md ===
+[full content of file]
+
+[original prompt content]
+```
+
+**`none` mode** (default): No injection, manual coordination required
+
+##### Default Instructions
+
+If `instruction` is not specified, the orchestrator uses context-appropriate defaults:
+
+- **list mode**: "The following files are required inputs for this task:"
+- **content mode**: "The following file contents are provided for context:"
+
+##### Injection Rules
+
+1. **Pattern Resolution**: Glob patterns are resolved to actual file paths before injection
+2. **Variable Substitution**: Variables in paths are substituted before injection
+3. **Missing Optional Files**: Omitted from injection without error
+4. **Empty Required Patterns**: If a required pattern matches no files, dependency validation fails (no injection occurs)
+5. **Position**: 
+   - `prepend`: Injection appears before original prompt content
+   - `append`: Injection appears after original prompt content
+
+#### Migration Notes
+
+##### From v1.1 to v1.1.1
+Existing workflows with `depends_on` continue to work unchanged. To adopt injection:
+
+**Before (v1.1):**
+```yaml
+# Had to maintain file list in both places
+depends_on:
+  required:
+    - "artifacts/architect/*.md"
+input_file: "prompts/implement.md"  # Must list files manually
+```
+
+**After (v1.1.1):**
+```yaml
+# Single source of truth
+depends_on:
+  required:
+    - "artifacts/architect/*.md"
+  inject: true  # Automatically informs provider
+input_file: "prompts/generic_implement.md"  # Can be generic
+```
+
+##### Benefits of Injection
+- **DRY Principle**: Declare files once in YAML
+- **Pattern Support**: `*.md` expands automatically
+- **Maintainability**: Change file lists in one place
+- **Flexibility**: Generic prompts work across projects
+
 ---
 
 ## Provider Configuration
@@ -397,6 +572,7 @@ Path Convention: All file paths included within a status JSON file (e.g., in the
 ## Example: Multi-Agent Inbox Processing
 
 ```yaml
+version: "1.1"
 name: "multi_agent_feature_dev"
 strict_flow: true
 
@@ -407,7 +583,22 @@ providers:
       model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
 
 steps:
-  # Check for pending engineer tasks
+  # Architect creates design documents
+  - name: ArchitectDesign
+    agent: "architect"
+    provider: "claude"
+    input_file: "prompts/architect/design_system.md"
+    output_file: "artifacts/architect/design_log.md"  # Captures thinking
+    # Claude creates: artifacts/architect/system_design.md, api_spec.md
+    
+  # Check what architect created
+  - name: ValidateArchitectOutput
+    command: ["test", "-f", "artifacts/architect/system_design.md"]
+    on:
+      failure:
+        goto: ArchitectFailed
+        
+  # Check for engineer tasks in inbox
   - name: CheckEngineerInbox
     command: ["find", "inbox/engineer", "-name", "*.task", "-type", "f"]
     output_capture: "lines"
@@ -415,9 +606,20 @@ steps:
       success:
         goto: ProcessEngineerTasks
       failure:
-        goto: NoTasks
-
-  # Process each task
+        goto: CreateEngineerTasks
+        
+  # Create tasks from architect output
+  - name: CreateEngineerTasks
+    command: ["bash", "-c", "
+      echo 'Implement the system described in:' > inbox/engineer/implement.tmp &&
+      ls artifacts/architect/*.md >> inbox/engineer/implement.tmp &&
+      mv inbox/engineer/implement.tmp inbox/engineer/implement.task
+    "]
+    on:
+      success:
+        goto: CheckEngineerInbox
+        
+  # Process each engineer task
   - name: ProcessEngineerTasks
     for_each:
       items_from: "steps.CheckEngineerInbox.lines"
@@ -426,32 +628,51 @@ steps:
         - name: ImplementWithClaude
           agent: "engineer"
           provider: "claude"
-          provider_params:
-            model: "claude-sonnet-4-20250514"
-          input_file: "${task_file}"  # task_file is already a full path from find
-          output_file: "artifacts/engineer/execution_log_${loop.index}.md"  # Captures STDOUT
-          # Note: Claude will create implementation files directly
+          input_file: "prompts/engineer/generic_implement.md"  # Now can be generic!
+          output_file: "artifacts/engineer/impl_log_${loop.index}.md"
+          depends_on:
+            required:  # Must have architect's designs
+              - "artifacts/architect/system_design.md"
+              - "artifacts/architect/api_spec.md"
+            optional:  # Nice to have if available
+              - "docs/coding_standards.md"
+              - "artifacts/architect/examples.md"
+            inject:
+              mode: "list"
+              instruction: "Implement the system based on these architecture documents:"
+          on:
+            failure:
+              goto: HandleMissingDependencies
+          # Claude writes: src/impl_${loop.index}.py
           
         - name: WriteStatus
-          command: ["echo", '{"success": true, "task": "${task_file}"}']
+          command: ["echo", '{"success": true, "task": "${task_file}", "impl": "src/impl_${loop.index}.py"}']
           output_file: "artifacts/engineer/status_${loop.index}.json"
           output_capture: "json"
           
         - name: MoveToProcessed
-          command: ["mv", "${task_file}", "processed/${run.timestamp_utc}_${loop.index}/"]
+          command: ["bash", "-c", "mkdir -p processed/${run.timestamp_utc}_${loop.index} && mv ${task_file} processed/${run.timestamp_utc}_${loop.index}/"]
           
         - name: CreateQATask
           when:
             equals:
               left: "${steps.WriteStatus.json.success}"
               right: "true"
-          command: ["bash", "-c", "
-            echo 'Review impl_${loop.index}.py' > inbox/qa/review_${loop.index}.tmp &&
-            mv inbox/qa/review_${loop.index}.tmp inbox/qa/review_${loop.index}.task
-          "]
-
-  - name: NoTasks
-    command: ["echo", "No pending tasks"]
+          command: ["echo", "Review src/impl_${loop.index}.py from ${task_file}"]
+          output_file: "inbox/qa/review_${loop.index}.task"
+          depends_on:
+            required:
+              - "src/impl_${loop.index}.py"  # Verify engineer created it
+              
+  # Error handlers
+  - name: ArchitectFailed
+    command: ["echo", "ERROR: Architect did not create required design files"]
+    on:
+      success:
+        goto: _end
+        
+  - name: HandleMissingDependencies  
+    command: ["echo", "ERROR: Required architect artifacts missing for engineer"]
     on:
       success:
         goto: _end
@@ -512,6 +733,153 @@ steps:
 
 ---
 
+## Example: File Dependencies in Complex Workflows
+
+This example demonstrates all dependency features including patterns, variables, and loops:
+
+```yaml
+version: "1.1"
+name: "data_pipeline_with_dependencies"
+
+context:
+  dataset: "customer_2024"
+  model_version: "v3"
+
+steps:
+  # Validate all input data exists
+  - name: ValidateInputs
+    command: ["echo", "Checking inputs..."]
+    depends_on:
+      required:
+        - "config/pipeline.yaml"
+        - "data/${context.dataset}/*.csv"  # Variable substitution
+        - "models/${context.model_version}/weights.pkl"
+      optional:
+        - "cache/${context.dataset}/*.parquet"
+    
+  # Process each CSV file
+  - name: ProcessDataFiles
+    command: ["find", "data/${context.dataset}", "-name", "*.csv"]
+    output_capture: "lines"
+    
+  - name: TransformFiles
+    for_each:
+      items_from: "steps.ProcessDataFiles.lines"
+      as: csv_file
+      steps:
+        - name: ValidateAndTransform
+          provider: "data_processor"
+          input_file: "${csv_file}"
+          output_file: "processed/${loop.index}.parquet"
+          depends_on:
+            required:
+              - "${csv_file}"  # Current iteration file
+              - "config/transformations.yaml"
+            optional:
+              - "processed/${loop.index}.cache"  # Previous run cache
+              
+        - name: GenerateReport
+          provider: "claude"
+          input_file: "prompts/analyze_data.md"
+          output_file: "reports/analysis_${loop.index}.md"
+          depends_on:
+            required:
+              - "processed/${loop.index}.parquet"  # From previous step
+              
+  # Final aggregation needs all processed files
+  - name: AggregateResults
+    provider: "aggregator"
+    input_file: "prompts/aggregate.md"
+    output_file: "reports/final_report.md"
+    depends_on:
+      required:
+        - "processed/*.parquet"  # Glob pattern for all outputs
+      optional:
+        - "reports/analysis_*.md"  # All analysis reports
+```
+
+---
+
+## Example: Dependency Injection Modes
+
+```yaml
+version: "1.1"
+name: "injection_modes_demo"
+
+steps:
+  # Simple injection with defaults
+  - name: SimpleReview
+    provider: "claude"
+    input_file: "prompts/generic_review.md"
+    depends_on:
+      required:
+        - "src/*.py"
+      inject: true  # Uses default instruction
+    
+  # List mode with custom instruction
+  - name: ImplementFromDesign
+    provider: "claude"
+    input_file: "prompts/implement.md"
+    depends_on:
+      required:
+        - "artifacts/architect/*.md"
+      inject:
+        mode: "list"
+        instruction: "Your implementation must follow these design documents:"
+        position: "prepend"
+    
+  # Content mode for data processing
+  - name: ProcessJSON
+    provider: "data_processor"
+    input_file: "prompts/transform.md"
+    depends_on:
+      required:
+        - "data/input.json"
+      inject:
+        mode: "content"
+        instruction: "Transform this JSON data according to the rules below:"
+        position: "prepend"
+    # The actual JSON content is injected before the transformation rules
+    
+  # Append mode for context
+  - name: GenerateReport
+    provider: "claude"
+    input_file: "prompts/report_template.md"
+    depends_on:
+      optional:
+        - "data/statistics/*.csv"
+      inject:
+        mode: "content"
+        instruction: "Reference data for your report:"
+        position: "append"
+    # Template comes first, data is appended as reference
+    
+  # Pattern expansion with injection
+  - name: ReviewAllCode
+    provider: "claude"
+    input_file: "prompts/code_review.md"
+    depends_on:
+      required:
+        - "src/**/*.py"  # Could match many files
+        - "tests/**/*.py"
+      inject:
+        mode: "list"
+        instruction: "Review all these Python files for quality and consistency:"
+    # All matched files are listed with clear instruction
+    
+  # No injection (classic mode)
+  - name: ManualCoordination
+    provider: "claude"
+    input_file: "prompts/specific_files_mentioned.md"
+    depends_on:
+      required:
+        - "data/important.csv"
+      inject: false  # Or omit inject entirely
+    # Prompt must manually reference the files
+```
+
+---
+
 ## Acceptance Tests
 
 1. Lines capture: `output_capture: lines` → `steps.X.lines[]` populated
@@ -532,6 +900,20 @@ steps:
 16. Wait for files: `wait_for` step blocks until matching files appear or timeout
 17. Wait timeout: `wait_for` with no matching files exits with code 124 after timeout
 18. Wait state tracking: `wait_for` records `files`, `wait_duration`, `poll_count` in state.json
+19. **Dependency Validation:** Step with `depends_on.required: ["missing.txt"]` fails with exit code 2
+20. **Dependency Patterns:** `depends_on.required: ["*.csv"]` correctly matches files using POSIX glob
+21. **Variable in Dependencies:** `depends_on.required: ["${context.file}"]` substitutes variable before validation
+22. **Loop Dependencies:** Dependencies re-evaluated each iteration with current loop context
+23. **Optional Dependencies:** Missing optional dependencies log warning but continue execution
+24. **Dependency Error Handler:** `on.failure` catches dependency validation failures (exit code 2)
+25. **Basic Injection:** Step with `inject: true` prepends default instruction and file list
+26. **List Mode Injection:** `inject.mode: "list"` correctly lists all resolved file paths
+27. **Content Mode Injection:** `inject.mode: "content"` includes full file contents
+28. **Custom Instruction:** `inject.instruction` replaces default instruction text
+29. **Append Position:** `inject.position: "append"` places injection after prompt content
+30. **Pattern Injection:** Glob patterns resolve to full file list before injection
+31. **Optional File Injection:** Missing optional files omitted from injection without error
+32. **No Injection Default:** Without `inject` field, no modification to prompt occurs
 
 ---
 
