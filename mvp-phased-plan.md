@@ -18,6 +18,7 @@ Inputs considered: MULTI_AGENT_ORCHESTRATION_V1.1_SPEC.md (updated), arch.md, or
   - Headless provider invocation that passes prompt content as a single argv token (not stdin) and captures stdout to a log file.
   - Path safety: reject absolute paths and any path containing `..`; follow symlinks but reject if resolved path escapes WORKSPACE.
   - POSIX glob semantics only (`*`, `?`); no recursive `**`.
+  - Mutual exclusivity: steps use either `provider` or `command`, not both; `command_override` is disallowed (use `command`).
   - Simple, linear control flow sufficient to demo architect → engineer → qa loop with at least one round-trip (engineer → qa feedback → engineer).
 
 - Non-goals for MVP (can be added later)
@@ -94,6 +95,7 @@ MVP uses a small YAML subset to define a linear flow with `provider`, `command` 
   - Validate path safety (no absolute paths or `..`; symlink resolution must stay inside WORKSPACE).
   - Enforce wait_for exclusivity (cannot combine with command/provider/for_each on same step).
   - Restrict glob semantics to POSIX `*` and `?` only.
+  - Enforce provider/command mutual exclusivity; reject any usage of `command_override`.
 
 2) File System Primitives (must-have)
   - Atomic write (tmp→rename), safe mkdir, move to processed/failed with timestamped folder.

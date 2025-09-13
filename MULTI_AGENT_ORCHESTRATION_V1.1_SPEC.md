@@ -307,8 +307,8 @@ provider: "claude"
 provider_params:
   model: "claude-sonnet-4-20250514"  # Options: claude-opus-4-1-20250805
 
-# Command override
-command_override: ["claude", "-p", "Custom prompt"]
+# Raw command (mutually exclusive with provider)
+command: ["claude", "-p", "Custom prompt"]
 
 # Wait for files (blocking primitive for inter-agent communication)
 wait_for:
@@ -380,10 +380,13 @@ State Fields: When `output_capture` is set to `lines` or `json`, the raw `output
 
 ### Command Construction and ${PROMPT}
 
-Command precedence:
-1. If `command_override` is set, it fully replaces the provider template.
-2. Else, use the provider template with merged parameters (`defaults` overridden by `provider_params`).
-3. Else, use the raw `command` array when no `provider` is specified.
+Mutual exclusivity (MVP rule):
+- A step must specify either `provider` (with optional `provider_params`) or a raw `command`, but not both. Using both is a validation error.
+- The deprecated `command_override` field is not supported; use a raw `command` step instead for fully manual invocations.
+
+Execution:
+- If `provider` is set, use the provider template with merged parameters (`defaults` overridden by `provider_params`).
+- If `command` is set (and no `provider`), execute the raw command array as-is.
 
 Reserved placeholder `${PROMPT}`:
 - Provider templates may include `${PROMPT}` to receive the composed input text as a single argv token.
@@ -700,8 +703,8 @@ steps:
     input_file: "prompts/analyze.md"
     output_file: "artifacts/architect/analysis.md"
 
-  - name: CustomProvider
-    command_override: ["claude", "-p", "Special prompt", "--model", "claude-opus-4-1-20250805"]
+  - name: ManualCommand
+    command: ["claude", "-p", "Special prompt", "--model", "claude-opus-4-1-20250805"]
 ```
 
 Claude Code is invoked with `claude -p "prompt" --model <model>`. Available models:
@@ -1197,7 +1200,7 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 6. Processed/failed: Success → `processed/{ts}/`, failure → `failed/{ts}/`
 7. No env namespace: `${env.*}` rejected by schema validator
 8. Provider templates: Template + defaults + params compose argv correctly
-9. Command override: Replaces template entirely
+9. Provider/Command exclusivity: Validation error when a step includes both `provider` and `command`
 10. Clean processed: `--clean-processed` empties directory
 11. Archive processed: `--archive-processed` creates zip on success
 12. Pointer Grammar: A workflow with `items_from: "steps.X.json.files"` correctly iterates over the nested `files` array
@@ -1225,6 +1228,7 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 34. **Conditional Skip:** When `when.equals` evaluates false, step `status` is `skipped` with `exit_code: 0`
 35. **Path Safety (Absolute):** Absolute paths are rejected at validation time
 36. **Path Safety (Parent Escape):** Paths containing `..` or symlinks resolving outside WORKSPACE are rejected
+37. **Deprecated override:** Using `command_override` is rejected by the schema/validator; authors must use `command` for manual invocations
 
 ---
 

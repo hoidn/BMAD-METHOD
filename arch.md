@@ -72,7 +72,7 @@ Implementation target: Python (>=3.11). Interface/type blocks may use TypeScript
   - Run ID creation, RUN_ROOT setup, atomic state writes (tmp + rename), rotating backups, corruption detection, repair/rollback, checksum enforcement.
 
 - Step Executor
-  - Builds argv from provider templates or `command_override`.
+  - Builds argv from provider templates (when `provider` is set) or executes a raw `command`.
   - Injects env + secrets (masked in logs), sets cwd, timeouts, retries.
   - Captures stdout/stderr with modes: text, lines, json; handles truncation/spillover.
 
@@ -224,7 +224,6 @@ interface StepCommand extends StepBase {
 interface StepProvider extends StepBase {
   provider: string;                       // e.g., 'claude'
   provider_params?: ProviderParams;       // e.g., { model: "..." }
-  command_override?: string[];            // replaces provider template
   input_file?: string;                    // prompt path (read into PROMPT)
   output_file?: string;                   // redirect stdout to file
 }
@@ -233,6 +232,8 @@ interface StepForEach extends StepBase {
   for_each: ForEachBlock;
 }
 
+// Validation: Steps must specify either provider (with optional provider_params) or a raw command, but not both.
+// The deprecated `command_override` field is not supported and should be rejected by the loader/validator.
 type Step = StepCommand | StepProvider | StepForEach | StepBase; // StepBase used only for wait_for-only steps
 
 interface WorkflowSpec {
@@ -341,7 +342,7 @@ interface StatusJsonV1 {
    - Else (command/provider step):
      - Resolve dependencies (globs) with variable substitution; error out (exit 2) if required missing.
      - Build `PROMPT` from `input_file` contents, applying dependency injection if requested.
-     - Build argv from provider template + `provider_params`, or from `command_override`, or raw `command`.
+  - Build argv from provider template + `provider_params` (when `provider` is set), or execute a raw `command`.
      - Spawn process; capture stdout/stderr per `output_capture` mode; enforce limits.
      - Redirect stdout to `output_file` if specified; still capture for state (truncated rules apply).
      - Record timings, exit_code; apply retries if configured; update state atomically after each attempt.
@@ -370,16 +371,17 @@ interface StatusJsonV1 {
 - Provider registry holds templates:
   - Example (Claude): `command: ["claude","-p","${PROMPT}","--model","${model}"]`
   - `defaults.model = 'claude-sonnet-4-20250514'` (configurable)
-- Command construction precedence:
-  1) `command_override` (step) if present
-  2) Provider template + merged params (`defaults` < `provider_params`)
-  3) Raw `command` (no provider) if specified
+- Command construction rules:
+  - Mutual exclusivity: a step may have either `provider` or `command`, not both. Validation error if both are present.
+  - If `provider` is present, use provider template + merged params (`defaults` overridden by `provider_params`).
+  - If `command` is present, execute it as-is.
 - Input handling: if `input_file`, read contents to PROMPT after optional dependency injection; pass as CLI argument (not stdin).
 - Output handling: if `output_file`, redirect child stdout to that file while still capturing for state until size limits.
 - Exit codes: 0 success; 1 retryable API error; 2 invalid input/non-retryable; 124 timeout (retryable).
 
 Contracts (summary):
-- Command construction precedence is enforced; template interpolation errors surface as `MissingTemplateKeyError` and map to exit code 2 at the step level.
+- Mutual exclusivity enforced by loader/validator; using both `provider` and `command` is invalid.
+- Template interpolation errors surface as `MissingTemplateKeyError` and map to exit code 2 at the step level.
 - Prompt handling is in-memory: `input_file` contents are read, optional dependency injection applies, then the composed prompt is passed via argv as `${PROMPT}`.
 
 
@@ -495,7 +497,7 @@ Contracts (summary):
   - injector: list/content modes, prepend/append, optional omissions
   - output capture: text/lines/json, limits, truncation, oversize JSON (exit 2), `allow_parse_error`
   - wait_for: timeout code 124, metrics recorded
-  - provider argv: template + defaults + overrides, `command_override`
+  - provider argv: template + defaults + `provider_params`; raw `command` executes as provided; reject `provider`+`command` and any `command_override` usage
   - CLI safety: clean/archive constraints
 
 - Integration tests (pytest)
@@ -525,7 +527,7 @@ Contracts (summary):
   - list/content modes; prepend/append; compose prompt string.
 
 7) Step executor
-  - Provider registry, argv builder, command_override; env/secrets; spawn; capture modes; truncation; retries.
+  - Provider registry, argv builder; env/secrets; spawn; capture modes; truncation; retries.
 
 8) Control flow
   - when.equals; on.success/on.failure goto; strict sequential default.
