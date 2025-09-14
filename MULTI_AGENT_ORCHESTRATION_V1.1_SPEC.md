@@ -122,9 +122,14 @@ Writing Tasks:
 1. Create as `*.tmp` file
 2. Atomic rename to `*.task`
 
-Processing Results:
-- Success: `mv <task> processed/{timestamp}/`
-- Failure (non-retryable): `mv <task> failed/{timestamp}/`
+Processing Results (Recommended Pattern — user‑managed):
+- Success: Use an explicit workflow step to `mv <task> processed/{timestamp}/`
+- Failure (non-retryable): Use an explicit workflow step to `mv <task> failed/{timestamp}/`
+
+Ownership Clarification:
+- The orchestrator does not automatically move, archive, or delete task files.
+- Queue directories and `*.task` files are conventions used by workflows; authors are responsible for file lifecycle via explicit steps.
+- The orchestrator provides blocking (`wait_for`) and safe CLI helpers (`--clean-processed`, `--archive-processed`) but never moves individual tasks on step success/failure.
 
 File Content: Freeform text; JSON recommended for structured data
 
@@ -292,6 +297,12 @@ Semantics:
 - `secrets` is a list of environment variable names that must be present in the orchestrator’s own environment. Values are passed through to the child process and are masked in orchestrator logs/state/debug outputs.
 - Missing secret: If a named secret is not present at execution time, the step fails with exit code 2 and an error context entry `missing_secrets: [..]`.
 - Masking: When `--debug` and standard logging capture environment snapshots or process output, occurrences of exact secret values are replaced with `***` where feasible. Note: masking is best-effort and based on known values at runtime.
+
+Source & precedence (clarified):
+- Secrets are sourced exclusively from the orchestrator process environment in v1.1. There is no implicit `.env` loading and no keychain integration.
+- If a key appears in both `env` and `secrets`, the child receives the `env` value; the key is still treated as a secret for masking.
+- Empty-string secret values count as present; only undefined variables are considered missing.
+- On missing secrets, the step exits 2 and `error.context.missing_secrets` lists all missing names.
 
 ---
 
@@ -557,6 +568,20 @@ Reserved placeholder `${PROMPT}` and input modes:
 - Provider templates may include `${PROMPT}` to receive the composed input text as a single argv token when using argv mode.
 - Providers may also declare `input_mode: "stdin"`, in which case the orchestrator pipes the composed prompt to the process stdin (and `${PROMPT}` must not be used in the template).
 - In both modes, the prompt is composed from `input_file` contents after optional dependency injection. Injection is performed in-memory; input files are never modified on disk.
+- If `${PROMPT}` is absent in `argv` mode, no prompt is passed via argv (this is valid; some CLIs read their own inputs or reference files directly).
+- If `${PROMPT}` appears in a template that declares `input_mode: "stdin"`, validation fails (see substitution semantics below).
+
+Provider template substitution (clarified):
+1) Compose prompt: Read `input_file` literally, apply `depends_on.inject` in-memory (if any) → composed prompt string.
+2) Merge params: `providers.<name>.defaults` overlaid by `step.provider_params` (step wins).
+3) Substitute inside merged params: Apply variable substitution to values in `provider_params` using all namespaces (`run`, `context`, `loop`, `steps`).
+4) Substitute template tokens (single pass): In each command token, replace
+   - `${PROMPT}` (argv mode only) with the composed prompt,
+   - `${<provider_param_key>}` with the resolved provider parameter value from step+defaults,
+   - `${run.*}`, `${context.*}`, `${loop.*}`, `${steps.*}` using current scopes.
+5) Escaping: Apply escapes before substitution — `$$` → `$`, `$${` → `${`.
+6) Unresolved placeholders: Any `${...}` remaining after substitution is a validation error. The step fails with exit code 2 and `error.context.missing_placeholders: ["key", ...]` (bare keys, without `${}`), or `invalid_prompt_placeholder` when `${PROMPT}` appears in `stdin` mode.
+7) Reference errors: If a referenced `steps.*` value is missing or of the wrong type (e.g., non-array where an array is required), the step fails with exit code 2 and `error.context.invalid_reference` details.
 
 ### Input/Output Contract
 
@@ -565,7 +590,7 @@ When a step specifies both `provider` and `input_file`:
 1. Input Handling:
    - argv mode (default): The orchestrator reads `input_file` contents and passes them as a single CLI argument via `${PROMPT}` in the provider template.
    - stdin mode: The orchestrator reads `input_file` contents and writes them to the child process stdin. The template must not use `${PROMPT}`.
-2. Output Handling: If `output_file` is specified, STDOUT is redirected to that file.
+2. Output Handling: If `output_file` is specified, STDOUT is tee'd to that file and to the orchestrator's capture pipeline.
 3. File contents passed literally: No variable substitution occurs inside the file; injection happens in-memory before passing to argv or stdin as per mode.
 
 Example Execution:
@@ -599,8 +624,14 @@ Key Benefits:
 - Provider flexibility: Provider can still read other files mentioned IN the prompt
 - Clean separation: `input_file` = the prompt, other files = data the prompt references
 
-Output capture with `output_file`:
-- When `output_file` is set, STDOUT is redirected to that file. The orchestrator still captures output per `output_capture` rules into state (subject to truncation and log redirection rules) for observability.
+Output capture with `output_file` (tee semantics):
+- When `output_file` is set, the orchestrator duplicates STDOUT to both the file and an in-memory buffer used for `output_capture` processing. This ensures the file receives the full stream while state/logs follow capture limits.
+
+Tee semantics details:
+- `text`: Store up to 8 KiB in `state.json`; if exceeded, set `truncated:true` and write full stdout to `logs/<StepName>.stdout`. The `output_file` always receives the full stream.
+- `lines`: Store up to 10,000 lines; if exceeded, set `truncated:true` and write full stdout to `logs/<StepName>.stdout`. The `output_file` always receives the full stream.
+- `json`: Buffer up to 1 MiB for parsing. On success, store parsed JSON; on overflow or invalid JSON, exit 2 unless `allow_parse_error:true`. The `output_file` always receives the full stream regardless of parse outcome.
+- Stderr is captured separately and written to `logs/<StepName>.stderr` when non-empty.
 
 ### Provider File Operations
 
@@ -695,7 +726,7 @@ depends_on:
   inject: true  # Enable auto-injection with defaults
 ```
 
-When `inject: true`, the orchestrator prepends:
+When `inject: true`, the orchestrator behaves exactly as if `inject: { mode: "list", position: "prepend" }` were specified, using the default instruction text. It prepends:
 ```
 The following files are required inputs for this task:
 - artifacts/architect/system_design.md
@@ -766,6 +797,7 @@ If `instruction` is not specified, the orchestrator uses context-appropriate def
 6. **Injection Target**: Injection modifies the in-memory prompt passed to the provider; the input_file on disk is not changed
 7. **Deterministic Ordering**: Resolved file paths are injected in stable lexicographic order (byte-wise, ascending)
 8. **File Headers (content mode)**: Each file is preceded by a header line `=== File: <relative/path> (<size info>) ===`; when truncated, `<size info>` shows `<shown_bytes>/<total_bytes>`; when not truncated, it may show either total bytes or a human-readable size
+9. **Shorthand Equivalence**: `inject: true` is equivalent to `inject: { mode: "list", position: "prepend" }`.
 
 ##### Size Limits and Truncation
 
@@ -983,6 +1015,8 @@ ${RUN_ROOT}/
 │   ├── StepName.stderr  # Step stderr (always if non-empty)
 │   └── StepName.debug   # Debug info (if --debug)
 └── artifacts/          # Step-created files
+
+Prompt audit (debug): When `--debug` is enabled, the composed prompt text (after dependency injection) is written to `logs/<StepName>.prompt.txt` with known secret values masked.
 ```
 
 ### Error Context
@@ -1395,7 +1429,7 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 3. Dynamic for-each: `items_from: "steps.List.lines"` iterates correctly
 4. Status schema: Write/read status.json with v1 schema
 5. Inbox atomicity: `*.tmp` → `rename()` → visible as `*.task`
-6. Processed/failed: Success → `processed/{ts}/`, failure → `failed/{ts}/`
+6. Queue management is user-driven: Steps explicitly move tasks to `processed/{ts}/` or `failed/{ts}/`; the orchestrator does not move individual tasks automatically
 7. No env namespace: `${env.*}` rejected by schema validator
 8. Provider templates: Template + defaults + params compose argv correctly (argv mode)
 9. Provider stdin mode: A provider with `input_mode: "stdin"` receives the composed prompt via stdin; `${PROMPT}` is not required in the template
@@ -1437,6 +1471,15 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 45. STDOUT capture threshold: When stdout exceeds 8 KiB, `state.output` is truncated and the full stream is written to `logs/<StepName>.stdout`
 46. When exists: A step with `when.exists: "path/*.txt"` evaluates true when ≥1 match exists
 47. When not_exists: A step with `when.not_exists: "missing/*.bin"` evaluates true when 0 matches exist
+
+48. Provider unresolved placeholders: A provider template containing `${model}` without a value in defaults or `provider_params` fails with exit 2 and `error.context.missing_placeholders:["model"]`
+49. Provider stdin misuse: A provider declaring `input_mode:"stdin"` and using `${PROMPT}` fails validation with exit 2 and `error.context.invalid_prompt_placeholder`
+50. Provider argv without `${PROMPT}`: In `argv` mode, a template without `${PROMPT}` runs and does not pass the prompt via argv
+51. Provider params substitution: Values in `provider_params` can reference `${run.*}`, `${context.*}`, `${loop.*}`, and `${steps.*}` and are resolved correctly
+52. Output tee semantics: With `output_file` set, the file contains the full stdout while state/log limits apply (`text` 8 KiB, `lines` 10k, `json` 1 MiB parse buffer)
+53. Injection shorthand: `inject:true` is equivalent to `inject:{mode:"list",position:"prepend"}` with default instruction
+54. Secrets source: Secrets are read exclusively from the orchestrator environment; absent variables cause exit 2 with `missing_secrets` and present empty strings are accepted
+55. Secrets + env precedence: When a key is in both `env` and `secrets`, the child receives the `env` value and it is masked in logs as a secret
 
 ---
 
