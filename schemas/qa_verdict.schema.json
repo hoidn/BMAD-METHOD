@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:orchestrate:qa_verdict:v1",
+  "title": "QA Verdict",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["approved"],
+  "properties": {
+    "approved": { "type": "boolean", "description": "True if the change is accepted" },
+    "reason": { "type": "string", "minLength": 1, "description": "Brief reason for the verdict" },
+    "task_id": { "type": "string", "description": "Identifier linking back to the originating task" },
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["message"],
+        "properties": {
+          "message": { "type": "string" },
+          "severity": { "type": "string", "enum": ["info", "warn", "error"] },
+          "path": { "type": "string" }
+        }
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Paths of relevant outputs/artifacts (relative to WORKSPACE)"
+    }
+  }
+}

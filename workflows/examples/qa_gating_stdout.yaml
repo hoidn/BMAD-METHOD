@@ -1,0 +1,30 @@
+version: "1.1.1"
+name: "qa_gating_stdout_example"
+
+providers:
+  claude:
+    command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
+    defaults:
+      model: "claude-sonnet-4-20250514"
+
+context:
+  task_id: "demo_001"
+
+steps:
+  - name: QAReviewStdout
+    agent: "qa"
+    provider: "claude"
+    input_file: "prompts/qa/review.md"
+    output_capture: "json"          # Enforce JSON-only stdout
+    depends_on:
+      required:
+        - "schemas/qa_verdict.schema.json"
+      inject:
+        mode: "content"
+        instruction: "Conform to this JSON Schema. Output ONLY the JSON document to STDOUT. No prose."
+
+  - name: AssertQAApproved
+    command: ["bash", "-lc", "test \"${steps.QAReviewStdout.json.approved}\" = \"true\""]
+
+  - name: Report
+    command: ["echo", "QA verdict approved via stdout JSON gate"]

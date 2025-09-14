@@ -1,0 +1,38 @@
+version: "1.1.1"
+name: "qa_gating_verdict_file_example"
+
+providers:
+  claude:
+    command: ["claude", "-p", "${PROMPT}", "--model", "${model}"]
+    defaults:
+      model: "claude-sonnet-4-20250514"
+
+context:
+  task_id: "demo_002"
+
+steps:
+  - name: QAReviewToFile
+    agent: "qa"
+    provider: "claude"
+    input_file: "prompts/qa/review.md"
+    output_capture: "text"          # Ignore stdout; instruct writing to file instead
+    depends_on:
+      required:
+        - "schemas/qa_verdict.schema.json"
+      inject:
+        mode: "content"
+        instruction: "Conform to this JSON Schema. Do NOT print to STDOUT. Write the verdict JSON to inbox/qa/results/${context.task_id}.json only."
+
+  - name: WaitForQAVerdict
+    wait_for:
+      glob: "inbox/qa/results/${context.task_id}.json"
+      timeout_sec: 3600
+
+  - name: ValidateSchemaBasics
+    command: ["bash", "-lc", "jq -e 'has(\"approved\") and ((.approved|type)==\"boolean\")' inbox/qa/results/${context.task_id}.json >/dev/null"]
+
+  - name: AssertQAApproved
+    command: ["bash", "-lc", "jq -e '.approved == true' inbox/qa/results/${context.task_id}.json >/dev/null"]
+
+  - name: Report
+    command: ["echo", "QA verdict approved via verdict-file gate"]
