@@ -1348,6 +1348,8 @@ steps:
 When agent B needs to process outputs from agent A:
 
 ```yaml
+# Note: Using depends_on.inject requires version: "1.1.1"
+
 steps:
   # Step 1: Agent A creates artifacts
   - name: ArchitectDesign
@@ -1355,28 +1357,23 @@ steps:
     provider: "claude"
     input_file: "prompts/architect/design.md"  # Contains prompt text
     output_file: "artifacts/architect/log.md"   # Captures STDOUT
-    
-    # prompts/architect/design.md contains:
-    # "Create a system architecture. Read requirements from artifacts/requirements/*.md
-    #  Write your design to artifacts/architect/system_design.md and api_spec.md"
-    
-    # Executes as:
-    # claude -p "Create a system architecture..." --model claude-sonnet-4-20250514 > artifacts/architect/log.md
-    
-  # Step 2: Compose dynamic task for Agent B (atomic write)
+    # Claude writes: artifacts/architect/system_design.md, api_spec.md
+
+  # Step 2: Drop a small queue task (atomic write)
   - name: PrepareEngineerTask
-    command: ["bash", "-c", "
-      echo 'Implement the following designs:' > inbox/engineer/task_${run.timestamp_utc}.tmp &&
-      echo '' >> inbox/engineer/task_${run.timestamp_utc}.tmp &&
-      cat artifacts/architect/*.md >> inbox/engineer/task_${run.timestamp_utc}.tmp &&
-      mv inbox/engineer/task_${run.timestamp_utc}.tmp inbox/engineer/task_${run.timestamp_utc}.task
-    "]
-    
-  # Step 3: Agent B processes dynamic task
+    command: ["bash", "-lc", "printf 'Implement the architecture.' > inbox/engineer/task_${run.timestamp_utc}.tmp && mv inbox/engineer/task_${run.timestamp_utc}.tmp inbox/engineer/task_${run.timestamp_utc}.task"]
+
+  # Step 3: Agent B processes task; inputs declared and injected
   - name: EngineerImplement
     agent: "engineer"
     provider: "claude"
-    input_file: "inbox/engineer/task_${run.timestamp_utc}.task"  # Dynamically composed
+    input_file: "inbox/engineer/task_${run.timestamp_utc}.task"
+    output_file: "artifacts/engineer/impl_log.md"
+    depends_on:
+      required:
+        - "artifacts/architect/system_design.md"
+        - "artifacts/architect/api_spec.md"
+      inject: true  # list/prepend with default instruction
 ```
 
 ### Best Practices
@@ -1385,6 +1382,8 @@ steps:
 - Build dynamic prompts at runtime to reference actual artifacts
 - Use `inbox/` for agent work queues to maintain clear task boundaries
 - Document the expected flow between agents in workflow comments
+
+Guidance: Prefer declaring inputs with `depends_on` and using `inject` to inform providers, rather than composing prompt text via shell (`cat`/`echo`). Keep shell usage focused on filesystem lifecycle (atomic writes/moves); let the orchestrator handle prompt composition and validation.
 
 ---
 
