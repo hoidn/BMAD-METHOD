@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-Versioning note: This document describes the v1.1 baseline and includes the v1.1.1 additions for dependency injection. The state schema uses `schema_version: "1.1.1"` to reflect these additions. Workflows written against v1.1 (without injection) remain valid. The workflow DSL `version:` and the state `schema_version` follow separate version tracks by design.
+Versioning note: This document describes the v1.1 baseline and includes the v1.1.1 additions for dependency injection. The state schema uses `schema_version: "1.1.1"` to reflect these additions. Workflows written against v1.1 (without injection) remain valid. The workflow DSL `version:` and the state `schema_version` follow separate version tracks by design. DSL validation is strict: unknown fields are rejected. Therefore, workflows that use `depends_on.inject` MUST set `version: "1.1.1"` (or higher); v1.1 workflows must not include `inject`.
 
 This specification defines a workflow orchestration system that executes sequences of commands, including LLM model invocations, in a deterministic order. The system uses YAML to define workflows with branching logic. Filesystem directories serve as task queues for inter-agent communication. Each workflow step can invoke shell commands or language model CLIs (Claude Code or Gemini CLI), capture its output in structured formats (text, lines array, or JSON), and have output files (including those created by agent invocation) registered as read dependencies for subsequent steps. The YAML-based orchestration DSL supports string comparison, conditional branching, and loop constructs.
 
@@ -222,11 +222,12 @@ Cross-platform note: Examples in this document use POSIX shell utilities (`bash`
    - `${loop.total}` - Total iterations
 
 3. Step Results
-   - `${steps.<name>.exit_code}` - Step completion code
-   - `${steps.<name>.output}` - Step stdout (text mode)
-   - `${steps.<name>.lines}` - Array when `output_capture: lines`
-   - `${steps.<name>.json}` - Object when `output_capture: json`
-   - `${steps.<name>.duration}` - Execution time
+  - `${steps.<name>.exit_code}` - Step completion code
+  - `${steps.<name>.output}` - Step stdout (text mode)
+  - `${steps.<name>.lines}` - Array when `output_capture: lines`
+  - `${steps.<name>.json}` - Object when `output_capture: json`
+  - `${steps.<name>.duration_ms}` - Execution time in milliseconds (preferred)
+  - `${steps.<name>.duration}` - Alias for milliseconds (deprecated; use `duration_ms`)
 
 4. Context Variables
    - `${context.<key>}` - Workflow-level variables
@@ -298,6 +299,12 @@ Semantics:
 - Missing secret: If a named secret is not present at execution time, the step fails with exit code 2 and an error context entry `missing_secrets: [..]`.
 - Masking: When `--debug` and standard logging capture environment snapshots or process output, occurrences of exact secret values are replaced with `***` where feasible. Note: masking is best-effort and based on known values at runtime.
 
+Environment inheritance and precedence (normative):
+- Base environment: child processes inherit the orchestrator’s current environment (e.g., `PATH`, `HOME`, etc.).
+- Secrets pass-through: for each name in `secrets`, the value is read from the orchestrator environment and included in the child environment.
+- Step `env` overlay: keys in `env` are overlaid last and take precedence over both base env and `secrets`.
+- Precedence summary: `child_env = base_env ∪ secrets ∪ env` with later sources winning on key conflicts.
+
 Source & precedence (clarified):
 - Secrets are sourced exclusively from the orchestrator process environment in v1.1. There is no implicit `.env` loading and no keychain integration.
 - If a key appears in both `env` and `secrets`, the child receives the `env` value; the key is still treated as a secret for masking.
@@ -335,6 +342,8 @@ steps: Step[]                   # See Step Schema
 Path safety: Absolute paths and any path containing `..` are rejected during validation; symlinks are followed but must resolve within WORKSPACE.
 
 Versioning: The workflow DSL `version:` and the persisted state `schema_version` follow separate version tracks.
+
+Validation policy (DSL): The schema validator is strict and rejects unknown fields at the declared DSL `version`. Feature availability is gated by `version:`. Using fields introduced in 1.1.1 (e.g., `depends_on.inject`) requires `version: "1.1.1"` or higher.
 
 ---
 
@@ -439,6 +448,17 @@ State recording for `wait_for`:
 - `poll_count`: number of polls performed
 - `timed_out`: boolean indicating whether timeout was reached
 
+Example state fragment (`steps.<StepName>`):
+```json
+{
+  "status": "completed",
+  "files": ["inbox/engineer/replies/task_001.task"],
+  "wait_duration_ms": 12345,
+  "poll_count": 25,
+  "timed_out": false
+}
+```
+
 # Control
 timeout_sec?: number                           # Applies to provider/command; exit 124 on timeout
 retries?:                                      # Optional per-step override
@@ -471,6 +491,7 @@ Notes:
 - `when` supports `equals`, `exists`, and `not_exists` in v1.1; `equals` compares values as strings (see Type Coercion in Conditions).
 - `on` handlers take precedence over `strict_flow`: if an appropriate `goto` is present it is honored; otherwise `strict_flow` and CLI `--on-error` determine behavior.
 - Retry policy defaults: Provider steps consider exit codes `1` and `124` retryable; raw `command` steps are not retried unless a per-step `retries` block is specified. Step-level settings override CLI/global defaults.
+ - Validation of `goto` targets: A `goto` must reference an existing step name or `_end`. Unknown targets are a validation error (exit code 2) reported at workflow load time.
 
 ### Loop Scoping and State Representation
 
@@ -526,6 +547,10 @@ If the reference is missing or not an array, the step fails with exit code 2 and
 }
 ```
 
+Line-splitting and normalization:
+- Lines are split on LF (`\n`). CRLF (`\r\n`) is normalized to LF in the `lines[]` entries.
+- The raw, unmodified stdout stream is preserved in `logs/<StepName>.stdout` only when truncation occurs (see Limits) or when JSON parsing fails.
+
 `json`: Parse as JSON object
 ```json
 {
@@ -536,6 +561,12 @@ If the reference is missing or not an array, the step fails with exit code 2 and
 ```
 
 Parse failure → exit code 2 unless `allow_parse_error: true`
+
+When `allow_parse_error: true` and parsing fails due to invalid JSON or size overflow:
+- The step completes with `exit_code: 0`.
+- `state.json` stores the raw text in `steps.<StepName>.output` (subject to the 8 KiB text limit) and sets `truncated` accordingly.
+- No `json` field is present.
+- A diagnostic entry is recorded at `steps.<StepName>.debug.json_parse_error: { reason: "invalid|overflow" }`.
 
 Limits:
 - text: The first 8 KiB of stdout is stored in the state file. If stdout exceeds 8 KiB, `truncated: true` is set and the full stdout stream is written to `${RUN_ROOT}/logs/<StepName>.stdout`.
@@ -548,6 +579,7 @@ State Fields: When `output_capture` is set to `lines` or `json`, the raw `output
 - `strict_flow: true` means any non-zero exit halts the run unless an `on.failure.goto` is defined for that step.
 - `_end` is a reserved `goto` target that terminates the run successfully.
 - Precedence: `on` handlers on the step (if present) are evaluated first; if none apply, `strict_flow` and the CLI `--on-error` setting determine whether to stop or continue.
+ - Validation: `goto` targets must reference an existing step or `_end`; unknown targets are a validation error (exit 2) at validation time.
 
 ## Provider Execution Model
 
@@ -571,10 +603,14 @@ Reserved placeholder `${PROMPT}` and input modes:
 - If `${PROMPT}` is absent in `argv` mode, no prompt is passed via argv (this is valid; some CLIs read their own inputs or reference files directly).
 - If `${PROMPT}` appears in a template that declares `input_mode: "stdin"`, validation fails (see substitution semantics below).
 
+Arg length guidance:
+- Some operating systems impose limits on total argv size. When dependency injection (especially `content` mode) or large prompts are expected, prefer providers with `input_mode: "stdin"`.
+- The orchestrator does not automatically fall back to stdin when argv size is large; selection is explicit via the provider template.
+
 Provider template substitution (clarified):
 1) Compose prompt: Read `input_file` literally, apply `depends_on.inject` in-memory (if any) → composed prompt string.
 2) Merge params: `providers.<name>.defaults` overlaid by `step.provider_params` (step wins).
-3) Substitute inside merged params: Apply variable substitution to values in `provider_params` using all namespaces (`run`, `context`, `loop`, `steps`).
+3) Substitute inside merged params: Apply variable substitution to string values in `provider_params` (recursively visiting nested objects/arrays), using all namespaces (`run`, `context`, `loop`, `steps`). Non-string values are left unchanged.
 4) Substitute template tokens (single pass): In each command token, replace
    - `${PROMPT}` (argv mode only) with the composed prompt,
    - `${<provider_param_key>}` with the resolved provider parameter value from step+defaults,
@@ -697,6 +733,7 @@ steps:
 5. **Existence Check**: File OR directory present = exists
 6. **Path Resolution**: Relative to WORKSPACE
 7. **Symlinks**: Followed
+   - Safety: Symlinks must resolve within WORKSPACE; if a symlink’s real path escapes WORKSPACE, validation fails.
 8. **Loop Context**: Re-evaluated each iteration with current loop variables
 9. **Matching Semantics**: Matching uses POSIX-style globbing; dotfiles are matched only when explicitly specified; case sensitivity follows the host filesystem
 
@@ -831,7 +868,7 @@ In **content mode:**
 ```
 
 **Truncation Record:**
-When truncation occurs, state.json records:
+When truncation occurs, state.json records (at `steps.<StepName>.debug.injection`):
 ```json
 {
   "injection_truncated": true,
@@ -862,6 +899,7 @@ input_file: "prompts/implement.md"  # Must list files manually
 **After (v1.1.1):**
 ```yaml
 # Single source of truth
+version: "1.1.1"
 depends_on:
   required:
     - "artifacts/architect/*.md"
@@ -979,7 +1017,7 @@ Parameter handling: If a provider template does not reference a given `provider_
 }
 ```
 
-Default path: `artifacts/<agent>/status.json` or `status_<step>.json`
+Default path: `artifacts/<agent>/status_<step>.json` (recommended). Alternative convention: `artifacts/<agent>/status.json` to represent the most recent agent status.
 
 Path Convention: All file paths included within a status JSON file (e.g., in the `outputs` array) must be relative to the WORKSPACE directory.
 
@@ -1069,7 +1107,7 @@ steps:
 ## Example: Multi-Agent Inbox Processing
 
 ```yaml
-version: "1.1"
+version: "1.1.1"
 name: "multi_agent_feature_dev"
 strict_flow: true
 
@@ -1300,7 +1338,7 @@ steps:
 ## Example: Dependency Injection Modes
 
 ```yaml
-version: "1.1"
+version: "1.1.1"
 name: "injection_modes_demo"
 
 steps:
@@ -1465,7 +1503,7 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 39. Path Safety (Parent Escape): Paths containing `..` or symlinks resolving outside WORKSPACE are rejected
 40. Deprecated override: Using `command_override` is rejected by the schema/validator; authors must use `command` for manual invocations
 41. Secrets missing: Declared `secrets: ["X"]` with `X` absent causes exit code 2 and `error.context.missing_secrets: ["X"]`
-42. Secrets masking: When a secret value appears in logs/state, it is masked as `***`
+42. Secrets masking: When a secret value appears in logs/state, it is masked as `***` where feasible (exact-value replacement based on known secret values)
 43. Loop state indexing: Results for `for_each` are stored as `steps.<LoopName>[i].<StepName>`
 44. Provider params substitution: Values in `provider_params` support variable substitution
 45. STDOUT capture threshold: When stdout exceeds 8 KiB, `state.output` is truncated and the full stream is written to `logs/<StepName>.stdout`
