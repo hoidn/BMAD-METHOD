@@ -131,6 +131,8 @@ Ownership Clarification:
 - Queue directories and `*.task` files are conventions used by workflows; authors are responsible for file lifecycle via explicit steps.
 - The orchestrator provides blocking (`wait_for`) and safe CLI helpers (`--clean-processed`, `--archive-processed`) but never moves individual tasks on step success/failure.
 
+Post‑MVP note (planned/v1.2): An optional, version‑gated declarative helper for per‑item lifecycle (see “Declarative Task Lifecycle for for_each (v1.2)” below) can move items at the end of an iteration. This is opt‑in and does not change MVP defaults.
+
 File Content: Freeform text; JSON recommended for structured data
 
 Configuration:
@@ -141,6 +143,94 @@ processed_dir: "processed"
 failed_dir: "failed"
 task_extension: ".task"
 ```
+
+## Declarative Task Lifecycle for for_each (v1.2)
+
+Status: Planned future feature. Opt‑in, version‑gated. Does not change MVP defaults.
+
+Version gating:
+- Requires `version: "1.2"` or higher. Using `on_item_complete` at lower versions is a validation error (exit code 2).
+
+Purpose:
+- Reduce boilerplate by declaratively moving a per‑item task file after an iteration completes, based on item success/failure.
+
+Schema (inside `for_each`):
+```yaml
+on_item_complete?:
+  success?:
+    move_to?: string   # Destination directory under WORKSPACE; variables allowed
+  failure?:
+    move_to?: string   # Destination directory under WORKSPACE; variables allowed
+```
+
+Semantics:
+- Trigger timing: Evaluated once per item after its `steps` finish.
+- Success: All executed steps ended with `exit_code: 0` after retries, and no `goto` escaped the loop before finishing.
+- Failure: Any step failed after retries, or a timeout (124) remained, or a `goto` jumped outside the loop/`_end` before finishing.
+- Recovery: If a step fails but is recovered by `on.failure` and the item completes, the item counts as success.
+- Variable substitution: `${run.*}`, `${loop.*}`, `${context.*}`, `${steps.*}` are supported in `move_to`.
+- Path safety: `move_to` follows the same rules as other paths and must resolve within WORKSPACE. Absolute/parent‑escape paths are rejected.
+- Missing source: If the original item path no longer exists when applying the action, record a lifecycle error; do not change the item’s result.
+- Idempotency/resume: Lifecycle is idempotent; on resume, previously applied actions are not repeated.
+
+State recording (per iteration):
+```json
+{
+  "lifecycle": {
+    "result": "success|failure",
+    "action": "move",
+    "from": "inbox/engineer/task_001.task",
+    "to": "processed/20250115T143022Z/task_001.task",
+    "action_applied": true,
+    "error": null
+  }
+}
+```
+
+Example:
+```yaml
+version: "1.2"
+steps:
+  - name: CheckEngineerInbox
+    command: ["find", "inbox/engineer", "-name", "*.task", "-type", "f"]
+    output_capture: "lines"
+
+  - name: ProcessEngineerTasks
+    for_each:
+      items_from: "steps.CheckEngineerInbox.lines"
+      as: task_file
+      on_item_complete:
+        success:
+          move_to: "processed/${run.timestamp_utc}"
+        failure:
+          move_to: "failed/${run.timestamp_utc}"
+      steps:
+        - name: Implement
+          provider: "claude"
+          input_file: "${task_file}"
+
+        - name: CreateQATask
+          command: ["bash", "-lc", "echo 'Review ${task_file}' > inbox/qa/$(basename \"${task_file}\").task"]
+
+        - name: WaitForQAVerdict
+          wait_for:
+            glob: "inbox/qa/results/$(basename \"${task_file}\").json"
+            timeout_sec: 3600
+
+        - name: AssertQAApproved
+          command: ["bash", "-lc", "jq -e '.approved == true' inbox/qa/results/$(basename \"${task_file}\").json >/dev/null"]
+          on:
+            failure: { goto: _end }  # Forces item failure; lifecycle will move to failed/
+```
+
+Planned acceptance (v1.2):
+1. Success path moves to `processed/…`; failure path moves to `failed/…`.
+2. Failure recovered by `on.failure` and item completes → success move.
+3. `goto` escaping the loop triggers failure move.
+4. Unsafe `move_to` (outside WORKSPACE) rejected at validation.
+5. Variable substitution in `move_to` resolves correctly.
+6. Idempotent on resume; no double move.
+7. Missing source logs lifecycle error; item result unchanged.
 
 ---
 
@@ -347,6 +437,18 @@ Validation policy (DSL): The schema validator is strict and rejects unknown fiel
 
 ---
 
+### Version Gating Summary
+
+| DSL version | Key features enabled | Notes |
+| --- | --- | --- |
+| 1.1 | Baseline DSL; providers (argv/stdin), `wait_for`, `depends_on` (required/optional), `when` (equals/exists/not_exists), retries/timeouts, strict path safety | State schema initially 1.1.1 (separate track). Unknown DSL fields rejected. |
+| 1.1.1 | `depends_on.inject` (list/content/none), injection truncation recording | Workflows must declare `version: "1.1.1"` to use `inject`. |
+| 1.2 (planned) | `for_each.on_item_complete` declarative per‑item lifecycle (move_to on success/failure) | Opt‑in; path safety and substitution apply. State gains per‑iteration `lifecycle` fields; state schema will bump accordingly when released. |
+
+The workflow DSL `version:` and the persisted state `schema_version` follow separate version tracks. Validators MUST enforce that DSL fields are only available at or above their introducing version.
+
+---
+
 ## Step Schema
 
 ### Fields
@@ -482,6 +584,14 @@ for_each?:                                     # Dynamic block iteration
   items?: any[]                                # Literal array alternative
   as?: string                                  # Variable name for current item (default: item)
   steps: Step[]                                # Nested steps executed per item
+
+  # Future (v1.2): Declarative per-item lifecycle (opt-in, version-gated)
+  # Only valid when `version: "1.2"` or higher
+  on_item_complete?:
+    success?:
+      move_to?: string                         # Destination dir under WORKSPACE; vars allowed
+    failure?:
+      move_to?: string                         # Destination dir under WORKSPACE; vars allowed
 ```
 
 Notes:
@@ -1198,7 +1308,7 @@ steps:
           depends_on:
             required:
               - "src/impl_${loop.index}.py"  # Verify engineer created it
-              
+
   # Error handlers
   - name: ArchitectFailed
     command: ["echo", "ERROR: Architect did not create required design files"]
@@ -1528,3 +1638,19 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 - Parallel execution blocks
 - Complex expression evaluation
 - Event-driven triggers
+
+---
+
+## Future Acceptance (v1.2)
+
+Planned acceptance tests for the declarative per‑item lifecycle helper (`for_each.on_item_complete`) and related semantics:
+
+1. Success path: After all item steps succeed, the item is moved to `processed/<ts>/...` per `success.move_to`.
+2. Failure path: If any item step fails after retries or times out, the item is moved to `failed/<ts>/...` per `failure.move_to`.
+3. Recovery within item: A step fails but an `on.failure` handler recovers and the item reaches the end → treated as success, item moved via `success.move_to`.
+4. Goto escape: A `goto` that exits the loop or jumps to `_end` before finishing marks the item as failure and triggers `failure.move_to`.
+5. Path safety: A workflow specifying a `move_to` outside WORKSPACE (absolute or `..`) is rejected at validation time.
+6. Variable substitution: `${run.timestamp_utc}` and `${loop.index}` in `move_to` resolve correctly and deterministically.
+7. Idempotency/resume: Re‑running/resuming does not apply lifecycle actions twice; state reflects `action_applied: true` after the first application.
+8. Missing source: If the item file no longer exists at lifecycle time, the orchestrator records a lifecycle error but does not change the item’s success/failure result.
+9. State recording: Per‑iteration `lifecycle` object is present with `result`, `action`, `from`, `to`, `action_applied`, and optional `error`.
