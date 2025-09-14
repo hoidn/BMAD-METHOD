@@ -444,6 +444,7 @@ Validation policy (DSL): The schema validator is strict and rejects unknown fiel
 | 1.1 | Baseline DSL; providers (argv/stdin), `wait_for`, `depends_on` (required/optional), `when` (equals/exists/not_exists), retries/timeouts, strict path safety | State schema initially 1.1.1 (separate track). Unknown DSL fields rejected. |
 | 1.1.1 | `depends_on.inject` (list/content/none), injection truncation recording | Workflows must declare `version: "1.1.1"` to use `inject`. |
 | 1.2 (planned) | `for_each.on_item_complete` declarative per‑item lifecycle (move_to on success/failure) | Opt‑in; path safety and substitution apply. State gains per‑iteration `lifecycle` fields; state schema will bump accordingly when released. |
+| 1.3 (planned) | JSON output validation: `output_schema`, `output_require` for steps with `output_capture: json` | Enforces schema and simple assertions; incompatible with `allow_parse_error: true`. |
 
 The workflow DSL `version:` and the persisted state `schema_version` follow separate version tracks. Validators MUST enforce that DSL fields are only available at or above their introducing version.
 
@@ -521,6 +522,15 @@ input_file: string                            # Read as prompt/input; literal co
 output_file: string                           # Redirect STDOUT to file
 output_capture: text|lines|json               # Default: text
 allow_parse_error: boolean                    # Only when output_capture: json; default: false
+
+# Future (v1.3): JSON output validation (opt-in, version-gated)
+# Only valid when `version: "1.3"` or higher AND `output_capture: json` AND `allow_parse_error` is false
+output_schema?: string                         # Path to JSON Schema under WORKSPACE; variables allowed
+output_require?:                               # Simple built-in assertions on parsed JSON
+  - pointer: string                            # RFC 6901 JSON Pointer (e.g., "/approved")
+    exists?: boolean                           # Default: true; require presence
+    equals?: string|number|boolean|null        # Optional exact match
+    type?: string                              # One of: string|number|boolean|array|object|null
 
 # Environment
 env: { [key: string]: string }                # No orchestrator substitution
@@ -1378,6 +1388,24 @@ steps:
 
 ---
 
+### Non‑Normative Example: QA Verdict Pattern
+
+This section documents a recommended pattern for capturing QA approvals as JSON. It is application‑level (not required by the DSL).
+
+- Prompt and schema:
+  - `prompts/qa/review.md` — instructs QA agent to output only a single JSON object to STDOUT (or to write to a verdict file); includes guidance on logging explanations to `artifacts/qa/logs/`.
+  - `schemas/qa_verdict.schema.json` — JSON Schema defining the verdict shape (approved, reason, issues, outputs, task_id).
+- Usage patterns:
+  - STDOUT JSON gate: Set `output_capture: json` on the QA step and add an assertion step to gate success/failure deterministically.
+  - Verdict file gate: Instruct the agent to write JSON to `inbox/qa/results/<task_id>.json`, then `wait_for` the file and assert via `jq`.
+- Examples:
+  - `workflows/examples/qa_gating_stdout.yaml`
+  - `workflows/examples/qa_gating_verdict_file.yaml`
+
+Notes:
+- These patterns keep control flow deterministic without parsing prose. They complement (but do not depend on) the planned v1.3 hooks (`output_schema`, `output_require`).
+
+
 ## Example: File Dependencies in Complex Workflows
 
 This example demonstrates all dependency features including patterns, variables, and loops:
@@ -1654,3 +1682,20 @@ Planned acceptance tests for the declarative per‑item lifecycle helper (`for_e
 7. Idempotency/resume: Re‑running/resuming does not apply lifecycle actions twice; state reflects `action_applied: true` after the first application.
 8. Missing source: If the item file no longer exists at lifecycle time, the orchestrator records a lifecycle error but does not change the item’s success/failure result.
 9. State recording: Per‑iteration `lifecycle` object is present with `result`, `action`, `from`, `to`, `action_applied`, and optional `error`.
+
+---
+
+## Future Acceptance (v1.3)
+
+Planned acceptance tests for JSON output validation hooks on steps with `output_capture: json`:
+
+1. Schema pass: A step with `output_schema` whose stdout JSON conforms exits 0; state includes parsed JSON.
+2. Schema fail: Violating `output_schema` yields exit 2 and `error.context.json_schema_errors` with human‑readable messages.
+3. Parse fail: Non‑JSON stdout with `allow_parse_error: false` yields exit 2 and `error.message` indicating parse failure.
+4. Parse allowed: Using `allow_parse_error: true` together with `output_schema` is rejected at validation time (exit 2) as incompatible.
+5. Require pointer exists: `output_require: [{pointer: "/approved"}]` fails with exit 2 when pointer missing; passes when present.
+6. Require equals: `output_require: [{pointer: "/approved", equals: true}]` fails when value is not boolean true; passes otherwise.
+7. Require type: `output_require: [{pointer: "/issues", type: "array"}]` enforces JSON type; mismatch → exit 2.
+8. Multiple requirements: All listed `output_require` constraints must pass; first failure is recorded in `error.context.json_require_failed` with the pointer and reason.
+9. Variable substitution: `output_schema` path supports `${context.*}` substitution and follows path safety rules under WORKSPACE.
+10. Large JSON: Oversize JSON (>1 MiB) remains governed by existing buffer limits and fails with exit 2 before validation.
