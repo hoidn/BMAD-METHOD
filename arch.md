@@ -169,6 +169,7 @@ interface ProviderTemplate {
   name: string;                 // e.g., 'claude'
   command: string[];            // argv template e.g., ["claude","-p","${PROMPT}","--model","${model}"]
   defaults?: ProviderParams;    // e.g., { model: 'claude-sonnet-4-20250514' }
+  input_mode?: 'argv' | 'stdin';// default: 'argv'; 'stdin' means pipe composed prompt to stdin
 }
 
 interface DependsOnConfigBasic {
@@ -369,20 +370,23 @@ interface StatusJsonV1 {
 ## 8) Provider Integration
 
 - Provider registry holds templates:
-  - Example (Claude): `command: ["claude","-p","${PROMPT}","--model","${model}"]`
-  - `defaults.model = 'claude-sonnet-4-20250514'` (configurable)
+  - Example (Claude): `command: ["claude","-p","${PROMPT}","--model","${model}"]`, `input_mode: 'argv'`
+  - Example (Codex): `command: ["codex","exec"]`, `input_mode: 'stdin'` (prompt via stdin)
+  - `defaults.model = 'claude-sonnet-4-20250514'` (configurable when CLI supports it)
 - Command construction rules:
   - Mutual exclusivity: a step may have either `provider` or `command`, not both. Validation error if both are present.
   - If `provider` is present, use provider template + merged params (`defaults` overridden by `provider_params`).
   - If `command` is present, execute it as-is.
-- Input handling: if `input_file`, read contents to PROMPT after optional dependency injection; pass as CLI argument (not stdin).
+- Input handling: if `input_file`, compose the prompt after optional dependency injection.
+  - If `input_mode` is 'argv' (default), pass the composed prompt via `${PROMPT}` as a single CLI argument (argv token).
+  - If `input_mode` is 'stdin', pipe the composed prompt to the child process stdin; provider templates MUST NOT reference `${PROMPT}` in this case.
 - Output handling: if `output_file`, redirect child stdout to that file while still capturing for state until size limits.
 - Exit codes: 0 success; 1 retryable API error; 2 invalid input/non-retryable; 124 timeout (retryable).
 
 Contracts (summary):
 - Mutual exclusivity enforced by loader/validator; using both `provider` and `command` is invalid.
 - Template interpolation errors surface as `MissingTemplateKeyError` and map to exit code 2 at the step level.
-- Prompt handling is in-memory: `input_file` contents are read, optional dependency injection applies, then the composed prompt is passed via argv as `${PROMPT}`.
+- Prompt handling is in-memory; composed prompt is delivered via argv token or piped to stdin depending on provider template `input_mode`.
 
 
 ## 9) Dependency Validation & Injection

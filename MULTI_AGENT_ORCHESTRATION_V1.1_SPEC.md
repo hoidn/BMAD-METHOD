@@ -2,6 +2,8 @@
 
 ## Executive Summary
 
+Versioning note: This document describes the v1.1 baseline and includes the v1.1.1 additions for dependency injection. The state schema uses `schema_version: "1.1.1"` to reflect these additions. Workflows written against v1.1 (without injection) remain valid. The workflow DSL `version:` and the state `schema_version` follow separate version tracks by design.
+
 This specification defines a workflow orchestration system that executes sequences of commands, including LLM model invocations, in a deterministic order. The system uses YAML to define workflows with branching logic. Filesystem directories serve as task queues for inter-agent communication. Each workflow step can invoke shell commands or language model CLIs (Claude Code or Gemini CLI), capture its output in structured formats (text, lines array, or JSON), and have output files (including those created by agent invocation) registered as read dependencies for subsequent steps. The YAML-based orchestration DSL supports string comparison, conditional branching, and loop constructs.
 
 ## Architecture Overview
@@ -32,6 +34,7 @@ Path Safety (MVP default):
 - Reject absolute paths and any path that contains `..` during validation.
 - Follow symlinks, but if the resolved real path escapes WORKSPACE, reject the path.
 - Enforce these checks at load time and before filesystem operations.
+ - Note: These safety checks apply to paths the orchestrator resolves (e.g., `input_file`, `output_file`, `depends_on`, `wait_for`). Child processes invoked by `command`/`provider` can read/write any locations permitted by the OS; use OS/user sandboxing if stricter isolation is required.
 
 ### Run Identity and State Management
 
@@ -52,7 +55,7 @@ The state file (`${RUN_ROOT}/state.json`) is the authoritative record of executi
   "workflow_checksum": "sha256:abcd1234...",
   "started_at": "2025-01-15T14:30:22Z",
   "updated_at": "2025-01-15T14:35:47Z",
-  "status": "running",  // running | completed | failed | suspended
+  "status": "running",  // running | completed | failed
   "context": {
     "key": "value"
   },
@@ -156,7 +159,7 @@ orchestrate run-step <step_name> --workflow workflows/demo.yaml   # Optional (po
 orchestrate watch workflows/demo.yaml                             # Optional (post-MVP)
 ```
 
-Safety: The `--clean-processed` flag will only operate on the `WORKSPACE/processed/` directory and will refuse to run on any other path. The `--archive-processed` destination path must be outside of the `processed/` directory. If a destination is not provided, the archive defaults to `RUN_ROOT/processed.zip`.
+Safety: The `--clean-processed` flag operates only on the configured `processed_dir` if and only if it resides under WORKSPACE; otherwise it fails. The `--archive-processed` destination path must be outside of the configured `processed_dir`. If a destination is not provided, the archive defaults to `RUN_ROOT/processed.zip`.
 
 ### Extended CLI Options
 
@@ -165,8 +168,8 @@ Safety: The `--clean-processed` flag will only operate on the `WORKSPACE/process
 ```bash
 # Debug and observability
 --debug                 # Enable debug logging
---progress              # Show real-time progress
---trace                 # Include trace IDs in logs
+--progress              # Show real-time progress (post-MVP)
+--trace                 # Include trace IDs in logs (post-MVP)
 --dry-run              # Validate without execution
 
 # State management
@@ -197,12 +200,16 @@ ORCHESTRATE_LOG_LEVEL=debug     # Default log level
 ORCHESTRATE_KEEP_RUNS=30         # Days to keep old runs
 ```
 
+Cross-platform note: Examples in this document use POSIX shell utilities (`bash`, `find`, `mv`, `test`). On Windows, use WSL or equivalent tooling, or adapt commands to PowerShell/Windows-native equivalents (e.g., `find` → `Get-ChildItem -Recurse`, `test -f` → `Test-Path`, `mv` → `Move-Item -Force`).
+
 ## Variable Model
 
 ### Namespaces (precedence order)
 
 1. Run Scope
-   - `${run.timestamp_utc}` - The start time of the run, formatted as YYYYMMDDTHHMMSSZ
+   - `${run.id}` - The run identifier (e.g., `YYYYMMDDTHHMMSSZ-<6char>`)
+   - `${run.root}` - Run root directory path relative to WORKSPACE (e.g., `.orchestrate/runs/${run.id}`)
+   - `${run.timestamp_utc}` - The start time of the run, formatted as `YYYYMMDDTHHMMSSZ`
 
 2. Loop Scope
    - `${item}` - Current iteration value
@@ -227,6 +234,8 @@ Where Variables Are Substituted:
 - Provider parameters: `model: "${context.model_name}"`
 - Conditional values: `left: "${steps.Previous.output}"`
 - Dependency paths: `depends_on.required: ["data/${context.dataset}/*.csv"]`
+
+Variable substitution applies to `provider_params` values. It does not occur inside `env` values.
 
 Where Variables Are NOT Substituted:
 - File contents: The contents of files referenced by `input_file`, `output_file`, or any other file parameters are passed as-is without variable substitution
@@ -267,7 +276,7 @@ Portability Recommendations:
 
 ### Environment & Secrets
 
-Per-step environment injection (not substitution):
+Per-step environment injection (no orchestrator substitution):
 ```yaml
 steps:
   - name: Build
@@ -277,6 +286,44 @@ steps:
       - GITHUB_TOKEN          # Secret env vars (masked in logs)
     command: ["npm", "run", "build"]
 ```
+
+Semantics:
+- `env` is a string map that is passed to the child process environment as-is. The orchestrator does not perform variable substitution inside `env` values.
+- `secrets` is a list of environment variable names that must be present in the orchestrator’s own environment. Values are passed through to the child process and are masked in orchestrator logs/state/debug outputs.
+- Missing secret: If a named secret is not present at execution time, the step fails with exit code 2 and an error context entry `missing_secrets: [..]`.
+- Masking: When `--debug` and standard logging capture environment snapshots or process output, occurrences of exact secret values are replaced with `***` where feasible. Note: masking is best-effort and based on known values at runtime.
+
+---
+
+## Workflow Schema (Top-Level)
+
+The workflow file defines these top-level keys:
+
+```yaml
+version: string                 # Workflow DSL version (e.g., "1.1"); independent of state schema_version
+name: string                    # Human-friendly name
+strict_flow: boolean            # Default: true; non-zero exit halts unless on.failure.goto present
+context: { [key: string]: any } # Optional key/value map available via ${context.*}
+
+# Provider templates available to steps
+providers:                      # Optional
+  <provider-name>:
+    command: string[]           # May include ${PROMPT} in argv mode
+    input_mode: argv|stdin      # Default: argv
+    defaults: { [key: string]: any }
+
+# Directory configuration (all paths relative to WORKSPACE)
+inbox_dir: string               # Default: "inbox"
+processed_dir: string           # Default: "processed" (must be under WORKSPACE)
+failed_dir: string              # Default: "failed"   (must be under WORKSPACE)
+task_extension: string          # Default: ".task"
+
+steps: Step[]                   # See Step Schema
+```
+
+Path safety: Absolute paths and any path containing `..` are rejected during validation; symlinks are followed but must resolve within WORKSPACE.
+
+Versioning: The workflow DSL `version:` and the persisted state `schema_version` follow separate version tracks.
 
 ---
 
@@ -333,9 +380,123 @@ depends_on:
     position: "prepend"  # Where to inject: prepend | append
 ```
 
-Pointer Syntax: The value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions.
+### Step Schema — Consolidated (MVP + 1.1.1)
+
+```yaml
+# Required
+name: string
+
+# Optional metadata
+agent: string                                 # Informational only
+
+# Execution (mutually exclusive)
+provider: string                              # Name of provider template
+provider_params: object                       # Overrides for template defaults
+command: string[]                             # Raw command; no provider when set
+
+# IO
+input_file: string                            # Read as prompt/input; literal contents
+output_file: string                           # Redirect STDOUT to file
+output_capture: text|lines|json               # Default: text
+allow_parse_error: boolean                    # Only when output_capture: json; default: false
+
+# Environment
+env: { [key: string]: string }                # No orchestrator substitution
+secrets: string[]                             # Names of required env vars to pass-through and mask
+
+# Dependencies
+depends_on:
+  required: string[]                          # POSIX glob patterns; must match ≥1 path
+  optional: string[]                          # Missing → no error
+  inject: boolean |                           # false (default) or
+    {
+      mode: list|content|none                 # Default: none
+      instruction?: string                    # Default text if omitted
+      position?: prepend|append               # Default: prepend
+    }
+
+# Waiting (mutually exclusive with provider/command/for_each)
+wait_for:
+  glob: string                                # Required
+  timeout_sec?: number                         # Default: 300
+  poll_ms?: number                             # Default: 500
+  min_count?: number                           # Default: 1
+
+State recording for `wait_for`:
+- `files`: array of matched file paths at completion
+- `wait_duration_ms`: total milliseconds waited
+- `poll_count`: number of polls performed
+- `timed_out`: boolean indicating whether timeout was reached
+
+# Control
+timeout_sec?: number                           # Applies to provider/command; exit 124 on timeout
+retries?:                                      # Optional per-step override
+  max: number                                  # Default: 0
+  delay_ms?: number                            # Optional backoff delay
+
+when?:                                         # Basic conditionals
+  equals?:
+    left: string                               # After variable substitution
+    right: string                              # Compared as strings
+  exists?: string                               # POSIX glob; true if ≥1 match within WORKSPACE
+  not_exists?: string                           # POSIX glob; true if 0 matches within WORKSPACE
+
+on?:
+  success?: { goto: string }                   # Step name or _end
+  failure?: { goto: string }                   # Takes effect on non-zero exit
+  always?:  { goto: string }                   # Runs regardless; evaluated after success/failure
+
+for_each?:                                     # Dynamic block iteration
+  items_from?: string                          # Pointer to array in prior step
+  items?: any[]                                # Literal array alternative
+  as?: string                                  # Variable name for current item (default: item)
+  steps: Step[]                                # Nested steps executed per item
+```
+
+Notes:
+- Mutual exclusivity is validated: a step may specify exactly one of `provider`, `command`, or `wait_for`; `for_each` is a separate block form.
+- `timeout_sec` maps timeouts to exit code `124` and records timeout context in `state.json`.
+- `retries` applies only to the current step. If not set, CLI/global retry policy applies.
+- `when` supports `equals`, `exists`, and `not_exists` in v1.1; `equals` compares values as strings (see Type Coercion in Conditions).
+- `on` handlers take precedence over `strict_flow`: if an appropriate `goto` is present it is honored; otherwise `strict_flow` and CLI `--on-error` determine behavior.
+- Retry policy defaults: Provider steps consider exit codes `1` and `124` retryable; raw `command` steps are not retried unless a per-step `retries` block is specified. Step-level settings override CLI/global defaults.
+
+### Loop Scoping and State Representation
+
+Semantics within a `for_each` block:
+- Variable scope: `${item}` (or the alias from `as:`), `${loop.index}` (0-based), and `${loop.total}` are available to nested steps.
+- Step result references: Inside the loop, `${steps.<StepName>.*}` refers to the result of `<StepName>` from the current iteration.
+- Name resolution: Step names must be unique within the loop block; the same step name may appear in other scopes.
+- Cross-iteration access is not supported in v1.1 (e.g., referencing results from a different index).
+
+State storage for looped steps is indexed by iteration:
+
+```json
+{
+  "steps": {
+    "ProcessEngineerTasks": [
+      {
+        "ImplementWithClaude": { "status": "completed", "exit_code": 0 },
+        "WriteStatus":        { "status": "completed", "json": {"success": true} }
+      },
+      {
+        "ImplementWithClaude": { "status": "failed", "exit_code": 2 }
+      }
+    ]
+  }
+}
+```
+
+Pointer syntax: `for_each.items_from` must target an array produced by a prior step (e.g., `steps.List.lines` or `steps.Parse.json.files`). See also “For-Each Pointer Syntax”.
 
 ### Output Capture Modes
+
+#### For-Each Pointer Syntax
+
+See also: Loop Scoping and State Representation for how looped step results are stored and referenced.
+
+The `for_each.items_from` value must be a string in the format `steps.<StepName>.lines` or `steps.<StepName>.json[.<dot.path>]`. The referenced value must resolve to an array. Dot-paths do not support wildcards or advanced expressions.
+If the reference is missing or not an array, the step fails with exit code 2 and records error context.
 
 `text` (default): Traditional string capture
 ```json
@@ -366,15 +527,16 @@ Pointer Syntax: The value must be a string in the format `steps.<StepName>.lines
 Parse failure → exit code 2 unless `allow_parse_error: true`
 
 Limits:
-- text: The first 8 KB of stdout is stored in the state file. If the stream exceeds 1 MB, it is spilled to a log file and the `output` field is marked as truncated.
+- text: The first 8 KiB of stdout is stored in the state file. If stdout exceeds 8 KiB, `truncated: true` is set and the full stdout stream is written to `${RUN_ROOT}/logs/<StepName>.stdout`.
 - lines: A maximum of 10,000 lines are stored. If exceeded, the `lines` array will contain the first 10,000 entries and a `truncated: true` flag will be set.
-- json: The orchestrator will buffer up to 1 MB of stdout for parsing. If stdout exceeds this limit, parsing fails with exit code 2 (unless `allow_parse_error: true`). Invalid JSON also results in exit code 2.
+- json: The orchestrator will buffer up to 1 MiB of stdout for parsing. If stdout exceeds this limit, parsing fails with exit code 2 (unless `allow_parse_error: true`). Invalid JSON also results in exit code 2.
 
 State Fields: When `output_capture` is set to `lines` or `json`, the raw `output` field is omitted from the step's result in `state.json` to avoid data duplication.
 
 ### Control Flow Defaults (MVP)
 - `strict_flow: true` means any non-zero exit halts the run unless an `on.failure.goto` is defined for that step.
 - `_end` is a reserved `goto` target that terminates the run successfully.
+- Precedence: `on` handlers on the step (if present) are evaluated first; if none apply, `strict_flow` and the CLI `--on-error` setting determine whether to stop or continue.
 
 ## Provider Execution Model
 
@@ -388,17 +550,23 @@ Execution:
 - If `provider` is set, use the provider template with merged parameters (`defaults` overridden by `provider_params`).
 - If `command` is set (and no `provider`), execute the raw command array as-is.
 
-Reserved placeholder `${PROMPT}`:
-- Provider templates may include `${PROMPT}` to receive the composed input text as a single argv token.
-- `${PROMPT}` is built from `input_file` contents after optional dependency injection. Injection is performed in-memory; input files are never modified on disk.
+Timeouts:
+- When `timeout_sec` is set on a step, the orchestrator enforces it for provider/command executions. On timeout, the process receives a graceful termination signal, followed by a hard kill after a short grace period; the step records exit code `124` and timeout context in state.
+
+Reserved placeholder `${PROMPT}` and input modes:
+- Provider templates may include `${PROMPT}` to receive the composed input text as a single argv token when using argv mode.
+- Providers may also declare `input_mode: "stdin"`, in which case the orchestrator pipes the composed prompt to the process stdin (and `${PROMPT}` must not be used in the template).
+- In both modes, the prompt is composed from `input_file` contents after optional dependency injection. Injection is performed in-memory; input files are never modified on disk.
 
 ### Input/Output Contract
 
 When a step specifies both `provider` and `input_file`:
 
-1. Input Handling: The orchestrator reads `input_file` contents and passes them as a command-line argument to the provider
-2. Output Handling: If `output_file` is specified, STDOUT is redirected to that file
-3. File contents passed literally: The prompt text is passed as a CLI argument, not piped via STDIN
+1. Input Handling:
+   - argv mode (default): The orchestrator reads `input_file` contents and passes them as a single CLI argument via `${PROMPT}` in the provider template.
+   - stdin mode: The orchestrator reads `input_file` contents and writes them to the child process stdin. The template must not use `${PROMPT}`.
+2. Output Handling: If `output_file` is specified, STDOUT is redirected to that file.
+3. File contents passed literally: No variable substitution occurs inside the file; injection happens in-memory before passing to argv or stdin as per mode.
 
 Example Execution:
 ```yaml
@@ -432,7 +600,7 @@ Key Benefits:
 - Clean separation: `input_file` = the prompt, other files = data the prompt references
 
 Output capture with `output_file`:
-- When `output_file` is set, STDOUT is redirected to that file. The orchestrator still captures output per `output_capture` rules into state (subject to truncation/spill rules) for observability.
+- When `output_file` is set, STDOUT is redirected to that file. The orchestrator still captures output per `output_capture` rules into state (subject to truncation and log redirection rules) for observability.
 
 ### Provider File Operations
 
@@ -499,6 +667,7 @@ steps:
 6. **Path Resolution**: Relative to WORKSPACE
 7. **Symlinks**: Followed
 8. **Loop Context**: Re-evaluated each iteration with current loop variables
+9. **Matching Semantics**: Matching uses POSIX-style globbing; dotfiles are matched only when explicitly specified; case sensitivity follows the host filesystem
 
 #### Error Handling
 
@@ -595,6 +764,8 @@ If `instruction` is not specified, the orchestrator uses context-appropriate def
    - `prepend`: Injection appears before original prompt content
    - `append`: Injection appears after original prompt content
 6. **Injection Target**: Injection modifies the in-memory prompt passed to the provider; the input_file on disk is not changed
+7. **Deterministic Ordering**: Resolved file paths are injected in stable lexicographic order (byte-wise, ascending)
+8. **File Headers (content mode)**: Each file is preceded by a header line `=== File: <relative/path> (<size info>) ===`; when truncated, `<size info>` shows `<shown_bytes>/<total_bytes>`; when not truncated, it may show either total bytes or a human-readable size
 
 ##### Size Limits and Truncation
 
@@ -678,7 +849,7 @@ input_file: "prompts/generic_implement.md"  # Can be generic
 
 ### Direct CLI Integration
 
-The providers are Claude Code (`claude`), Gemini CLI (`gemini`), and similar tools - not raw API calls.
+The providers are Claude Code (`claude`), Gemini CLI (`gemini`), Codex CLI (`codex`), and similar tools — not raw API calls.
 
 Workflow-level templates:
 ```yaml
@@ -691,6 +862,12 @@ providers:
   gemini:
     command: ["gemini", "-p", "${PROMPT}"]
     # Gemini CLI doesn't support model selection via CLI
+
+  codex:
+    command: ["codex", "exec"]
+    input_mode: "stdin"   # Read prompt from stdin
+    defaults:
+      model: "gpt-5"      # Example default; can be overridden if CLI supports it
 ```
 
 Step-level usage:
@@ -705,6 +882,12 @@ steps:
 
   - name: ManualCommand
     command: ["claude", "-p", "Special prompt", "--model", "claude-opus-4-1-20250805"]
+
+  - name: PingWithCodex
+    provider: "codex"
+    input_file: "prompts/ping.md"
+    output_file: "artifacts/codex/ping_output.txt"
+    # Orchestrator pipes prompt to `codex exec` stdin
 ```
 
 Claude Code is invoked with `claude -p "prompt" --model <model>`. Available models:
@@ -713,11 +896,25 @@ Claude Code is invoked with `claude -p "prompt" --model <model>`. Available mode
 
 Model can also be set via `ANTHROPIC_MODEL` environment variable or `claude config set model`.
 
+Codex CLI is invoked with `codex exec` and reads the prompt from stdin. The orchestrator handles piping the composed prompt into stdin when `input_mode: "stdin"` is set for the provider template. Defaults such as model may be configured via provider defaults or the Codex CLI’s own configuration.
+
+### Provider Templates — Quick Reference
+
+| Provider | Command template | Input mode | Notes |
+| --- | --- | --- | --- |
+| claude | `claude -p ${PROMPT} --model ${model}` | argv | Default model via provider defaults (e.g., `claude-sonnet-4-20250514`) or CLI config/env. |
+| gemini | `gemini -p ${PROMPT}` | argv | Model selection may not be supported via CLI; rely on CLI configuration if applicable. |
+| codex | `codex exec` (prompt via stdin) | stdin | Reads prompt from stdin; `${PROMPT}` must not appear in template. Defaults (e.g., `model: gpt-5`) may be provided in provider defaults or via Codex CLI config. |
+
 Exit code mapping:
 - 0 = Success
 - 1 = Retryable API error
 - 2 = Invalid input (non-retryable)
 - 124 = Timeout (retryable)
+
+Note: Exit codes are intentionally coarse; consult `state.json` for rich error context (e.g., undefined variables, missing dependencies, JSON parse errors).
+
+Parameter handling: If a provider template does not reference a given `provider_params` key (e.g., `model` for a CLI that lacks model selection), the parameter is ignored with a debug log entry; this is not a validation error in v1.1.
 
 ---
 
@@ -730,7 +927,7 @@ Exit code mapping:
   "schema": "status/v1",
   "correlation_id": "uuid-or-opaque",
   "agent": "engineer",
-  "run_id": "uuid",
+  "run_id": "20250115T143022Z-a3f8c2",
   "step": "ImplementFeature",
   "timestamp": "2025-01-15T10:30:00Z",
   "success": true,
@@ -753,6 +950,8 @@ Exit code mapping:
 Default path: `artifacts/<agent>/status.json` or `status_<step>.json`
 
 Path Convention: All file paths included within a status JSON file (e.g., in the `outputs` array) must be relative to the WORKSPACE directory.
+
+Orchestrator interaction: The orchestrator does not consume or act on status JSON files. They are for observability and external tooling only; control flow derives solely from the workflow YAML and `state.json`.
 
 ## Debugging and Observability
 
@@ -826,12 +1025,11 @@ State file includes timing for performance analysis:
 - File I/O operations
 
 **Trace Context:**
-Each step can emit trace IDs for correlation with external systems:
+Each step can emit trace IDs for correlation with external systems. Use variable substitution in the command itself (env values are literal):
 ```yaml
 steps:
   - name: CallAPI
-    env:
-      TRACE_ID: "${run.id}-${steps.index}"
+    command: ["bash", "-c", "TRACE_ID=${run.id} curl https://example/api"]
 ```
 
 ## Example: Multi-Agent Inbox Processing
@@ -1158,7 +1356,7 @@ steps:
   - name: ProcessWithDebug
     command: ["python", "process.py"]
     env:
-      DEBUG: "${ORCHESTRATE_DEBUG:-0}"  # Inherit debug flag
+      DEBUG: "0"  # env values are literal; orchestrator does not substitute
     on:
       failure:
         goto: DiagnoseFailure
@@ -1166,8 +1364,8 @@ steps:
   - name: DiagnoseFailure
     command: ["bash", "-c", "
       echo 'Checking failure context...' &&
-      cat ${RUN_ROOT}/logs/ProcessWithDebug.stderr &&
-      jq '.steps.ProcessWithDebug.error' ${RUN_ROOT}/state.json
+      cat ${run.root}/logs/ProcessWithDebug.stderr &&
+      jq '.steps.ProcessWithDebug.error' ${run.root}/state.json
     "]
 ```
 
@@ -1199,36 +1397,46 @@ orchestrate resume 20250115T143022Z-a3f8c2 --debug
 5. Inbox atomicity: `*.tmp` → `rename()` → visible as `*.task`
 6. Processed/failed: Success → `processed/{ts}/`, failure → `failed/{ts}/`
 7. No env namespace: `${env.*}` rejected by schema validator
-8. Provider templates: Template + defaults + params compose argv correctly
-9. Provider/Command exclusivity: Validation error when a step includes both `provider` and `command`
-10. Clean processed: `--clean-processed` empties directory
-11. Archive processed: `--archive-processed` creates zip on success
-12. Pointer Grammar: A workflow with `items_from: "steps.X.json.files"` correctly iterates over the nested `files` array
-13. JSON Oversize: A step producing >1 MB of JSON correctly fails with exit code 2
-14. JSON Parse Error Flag: The same step from above succeeds if `allow_parse_error: true` is set
-15. CLI Safety: `orchestrate run --clean-processed` fails if the processed directory is configured outside WORKSPACE
-16. Wait for files: `wait_for` step blocks until matching files appear or timeout
-17. Wait timeout: `wait_for` with no matching files exits with code 124 after timeout
-18. Wait state tracking: `wait_for` records `files`, `wait_duration`, `poll_count` in state.json
-19. **Dependency Validation:** Step with `depends_on.required: ["missing.txt"]` fails with exit code 2
-20. **Dependency Patterns:** `depends_on.required: ["*.csv"]` correctly matches files using POSIX glob
-21. **Variable in Dependencies:** `depends_on.required: ["${context.file}"]` substitutes variable before validation
-22. **Loop Dependencies:** Dependencies re-evaluated each iteration with current loop context
-23. **Optional Dependencies:** Missing optional dependencies log warning but continue execution
-24. **Dependency Error Handler:** `on.failure` catches dependency validation failures (exit code 2)
-25. **Basic Injection:** Step with `inject: true` prepends default instruction and file list
-26. **List Mode Injection:** `inject.mode: "list"` correctly lists all resolved file paths
-27. **Content Mode Injection:** `inject.mode: "content"` includes full file contents
-28. **Custom Instruction:** `inject.instruction` replaces default instruction text
-29. **Append Position:** `inject.position: "append"` places injection after prompt content
-30. **Pattern Injection:** Glob patterns resolve to full file list before injection
-31. **Optional File Injection:** Missing optional files omitted from injection without error
-32. **No Injection Default:** Without `inject` field, no modification to prompt occurs
-33. **Wait-For Exclusivity:** A step that combines `wait_for` with `command`/`provider`/`for_each` is rejected by validation
-34. **Conditional Skip:** When `when.equals` evaluates false, step `status` is `skipped` with `exit_code: 0`
-35. **Path Safety (Absolute):** Absolute paths are rejected at validation time
-36. **Path Safety (Parent Escape):** Paths containing `..` or symlinks resolving outside WORKSPACE are rejected
-37. **Deprecated override:** Using `command_override` is rejected by the schema/validator; authors must use `command` for manual invocations
+8. Provider templates: Template + defaults + params compose argv correctly (argv mode)
+9. Provider stdin mode: A provider with `input_mode: "stdin"` receives the composed prompt via stdin; `${PROMPT}` is not required in the template
+10. Provider/Command exclusivity: Validation error when a step includes both `provider` and `command`
+11. Clean processed: `--clean-processed` empties directory
+12. Archive processed: `--archive-processed` creates zip on success
+13. Pointer Grammar: A workflow with `items_from: "steps.X.json.files"` correctly iterates over the nested `files` array
+14. JSON Oversize: A step producing >1 MB of JSON correctly fails with exit code 2
+15. JSON Parse Error Flag: The same step from above succeeds if `allow_parse_error: true` is set
+16. CLI Safety: `orchestrate run --clean-processed` fails if the processed directory is configured outside WORKSPACE
+17. Wait for files: `wait_for` step blocks until matching files appear or timeout
+18. Wait timeout: `wait_for` with no matching files exits with code 124 after timeout and sets `timed_out: true`
+19. Wait state tracking: `wait_for` records `files`, `wait_duration_ms`, `poll_count` in state.json
+20. Timeout (provider/command): A step with `timeout_sec` terminates process and records exit code 124
+21. Step retries: A provider step with `retries.max: 2` retries on exit codes 1/124 and respects `retries.delay_ms`; raw command steps retry only when `retries` is set
+22. Dependency Validation: Step with `depends_on.required: ["missing.txt"]` fails with exit code 2
+23. Dependency Patterns: `depends_on.required: ["*.csv"]` correctly matches files using POSIX glob
+24. Variable in Dependencies: `depends_on.required: ["${context.file}"]` substitutes variable before validation
+25. Loop Dependencies: Dependencies re-evaluated each iteration with current loop context
+26. Optional Dependencies: Missing optional dependencies are omitted from injection and do not fail the step
+27. Dependency Error Handler: `on.failure` catches dependency validation failures (exit code 2)
+28. Basic Injection: Step with `inject: true` prepends default instruction and file list
+29. List Mode Injection: `inject.mode: "list"` correctly lists all resolved file paths
+30. Content Mode Injection: `inject.mode: "content"` includes full file contents with truncation metadata when applicable
+31. Custom Instruction: `inject.instruction` replaces default instruction text
+32. Append Position: `inject.position: "append"` places injection after prompt content
+33. Pattern Injection: Glob patterns resolve to full file list before injection
+34. Optional File Injection: Missing optional files omitted from injection without error
+35. No Injection Default: Without `inject` field, no modification to prompt occurs
+36. Wait-For Exclusivity: A step that combines `wait_for` with `command`/`provider`/`for_each` is rejected by validation
+37. Conditional Skip: When `when.equals` evaluates false, step `status` is `skipped` with `exit_code: 0`
+38. Path Safety (Absolute): Absolute paths are rejected at validation time
+39. Path Safety (Parent Escape): Paths containing `..` or symlinks resolving outside WORKSPACE are rejected
+40. Deprecated override: Using `command_override` is rejected by the schema/validator; authors must use `command` for manual invocations
+41. Secrets missing: Declared `secrets: ["X"]` with `X` absent causes exit code 2 and `error.context.missing_secrets: ["X"]`
+42. Secrets masking: When a secret value appears in logs/state, it is masked as `***`
+43. Loop state indexing: Results for `for_each` are stored as `steps.<LoopName>[i].<StepName>`
+44. Provider params substitution: Values in `provider_params` support variable substitution
+45. STDOUT capture threshold: When stdout exceeds 8 KiB, `state.output` is truncated and the full stream is written to `logs/<StepName>.stdout`
+46. When exists: A step with `when.exists: "path/*.txt"` evaluates true when ≥1 match exists
+47. When not_exists: A step with `when.not_exists: "missing/*.bin"` evaluates true when 0 matches exist
 
 ---
 

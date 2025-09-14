@@ -15,7 +15,7 @@ Inputs considered: MULTI_AGENT_ORCHESTRATION_V1.1_SPEC.md (updated), arch.md, or
   - File protocol and directory structure for agent handoffs using `inbox/{agent}/`, `processed/{ts}/`, `failed/{ts}/`, and `.task` files.
   - Atomic task creation and movement to processed/failed.
   - Blocking `wait_for` for expected files with timeout (exclusive: cannot combine with command/provider/for_each on same step).
-  - Headless provider invocation that passes prompt content as a single argv token (not stdin) and captures stdout to a log file.
+  - Headless provider invocation that passes prompt content as a single argv token (claude/gemini) or via stdin (codex) and captures stdout to a log file.
   - Path safety: reject absolute paths and any path containing `..`; follow symlinks but reject if resolved path escapes WORKSPACE.
   - POSIX glob semantics only (`*`, `?`); no recursive `**`.
   - Mutual exclusivity: steps use either `provider` or `command`, not both; `command_override` is disallowed (use `command`).
@@ -105,7 +105,7 @@ MVP uses a small YAML subset to define a linear flow with `provider`, `command` 
   - Poll for matching files with timeout/poll interval; return list of matches.
 
 4) Provider Invocation Wrapper (must-have)
-  - Function to call `claude`/`gemini` passing prompt content as a single argv token (not stdin); capture stdout to a log file and return exit code.
+  - Function to call `claude`/`gemini` via argv token (`${PROMPT}`) or `codex` via stdin based on provider `input_mode`; capture stdout to a log file and return exit code.
 
 5) Orchestrator Core (must-have)
   - Execute the linear YAML-defined flow described in Section 4 with robust logging and error checks.
@@ -163,10 +163,11 @@ Deliverable: Fast fail on missing inputs; optional improved prompt context.
 
 ### Phase 5 — Provider Configuration and Output Capture Modes
 - Add provider defaults (e.g., default model) and per-step params.
+- Support providers with `input_mode: 'argv'` (e.g., claude/gemini) and `input_mode: 'stdin'` (e.g., codex).
 - Support output capture modes: text (default) and lines; JSON capture can wait until Phase 6.
 - Add truncation limits; large outputs log to a sidecar file if needed.
 
-Deliverable: More flexible provider usage; better control of outputs.
+Deliverable: More flexible provider usage (argv and stdin providers); better control of outputs.
 
 ### Phase 6 — Branching, for_each, and Pointers (Toward Spec)
 - Implement `when.equals`, `on.success/failure goto` for branching; mark false conditions as `skipped`.
